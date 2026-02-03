@@ -94,7 +94,7 @@ Where “tree” likely lives for SCN0:
 3) Implement SCN0: find equivalent table-driven structure; remove stride-scan fallback.
 
 ## Implementation note (repo)
-- `src/ScnParser.cs` now has an initial strict SCN1 path (`ParseScn1AllStrict`) that follows `sub_10014F20` structure:
+- `src/ScnParser.Scn1.cs` now has an initial strict SCN1 path (`ParseScn1AllStrict`) that follows `sub_10014F20` structure:
   - parse tree via hasChild/hasSibling (matches `sub_10015430`)
   - skip auto-block table (`sub_100155C0` shape) for cursor alignment
   - parse pairs (12 bytes each), 3 dwords, container blocks (size-prefixed), and the (group,idx,name) mapping table

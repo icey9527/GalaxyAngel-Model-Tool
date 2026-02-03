@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 
@@ -18,6 +19,7 @@ static class Converter
             .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
+        var errors = new List<string>();
         foreach (var scnPath in scnPaths)
         {
             try
@@ -27,38 +29,63 @@ static class Converter
                 var magic = System.Text.Encoding.ASCII.GetString(data, 0, 4);
                 if (magic != "SCN0" && magic != "SCN1") continue;
 
-                var stem = Path.GetFileNameWithoutExtension(scnPath);
-                Console.WriteLine(stem);
-                var dst = Path.Combine(outDir.FullName, magic.ToLowerInvariant(), stem);
-                if (Directory.Exists(dst))
-                    Directory.Delete(dst, recursive: true);
-                Directory.CreateDirectory(dst);
+                var relative = Path.GetRelativePath(inDir.FullName, scnPath);
+                var relativeDir = Path.GetDirectoryName(relative) ?? "";
+                var scnStem = Path.GetFileNameWithoutExtension(scnPath);
 
-                var mesh = magic == "SCN1"
-                    ? ScnParser.ParseScn1High(scnPath, data)
-                    : ScnParser.ParseScn0High(scnPath, data);
-                if (mesh == null) continue;
-                if (Environment.GetEnvironmentVariable("SCN_DEBUG") == "1")
-                {
-                    Console.WriteLine($"{magic} {stem}: v={mesh.Positions.Length} idx={mesh.Indices.Length} idx%3={mesh.Indices.Length % 3} subsets={mesh.Subsets.Count} mats={mesh.MaterialSets.Count}");
-                    for (var si = 0; si < Math.Min(mesh.Subsets.Count, 8); si++)
-                    {
-                        var s = mesh.Subsets[si];
-                        Console.WriteLine($"  subset[{si}] mat={s.MaterialId} startTri={s.StartTri} triCount={s.TriCount} baseV={s.BaseVertex} vCnt={s.VertexCount}");
-                    }
-                }
+                // Output layout:
+                // out/<scn0|scn1>/<relativeDir>/<scnFileStem>/<modelName>/*.obj + textures
+                var scnDir = Path.Combine(
+                    outDir.FullName,
+                    magic.ToLowerInvariant(),
+                    relativeDir,
+                    scnStem);
+
+                if (Directory.Exists(scnDir))
+                    Directory.Delete(scnDir, recursive: true);
+                Directory.CreateDirectory(scnDir);
+
+                var models = magic == "SCN1"
+                    ? ScnParser.ParseScn1All(scnPath, data)
+                    : ScnParser.ParseScn0All(scnPath, data);
+
+                if (models.Count == 0) continue;
 
                 var srcFolder = Path.GetDirectoryName(scnPath) ?? ".";
-                TexturePipeline.RewriteTexturesToPng(srcFolder, dst, mesh);
-                ObjWriter.Write(dst, stem, mesh);
+                var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var model in models)
+                {
+                    var folderName = SanitizePathSegment(model.Name);
+                    if (!usedNames.Add(folderName))
+                    {
+                        var n = 2;
+                        while (!usedNames.Add(folderName + "_" + n)) n++;
+                        folderName = folderName + "_" + n;
+                    }
+
+                    var modelDir = Path.Combine(scnDir, folderName);
+                    Directory.CreateDirectory(modelDir);
+
+                    TexturePipeline.RewriteTexturesToPng(srcFolder, modelDir, model.Mesh);
+                    ObjWriter.Write(modelDir, model.Name, model.Mesh);
+                }
             }
             catch (Exception ex)
             {
-                if (Environment.GetEnvironmentVariable("SCN_DEBUG") == "1")
-                    Console.Error.WriteLine($"[!] Failed: {scnPath}\n{ex}");
-                else
-                    Console.Error.WriteLine($"[!] Failed: {scnPath} ({ex.Message})");
+                errors.Add($"{Path.GetFileName(scnPath)}: {ex.Message}");
             }
         }
+
+        if (errors.Count > 0)
+            throw new Exception("Some files failed:\n" + string.Join("\n", errors.Take(25)) + (errors.Count > 25 ? "\n..." : ""));
+    }
+
+    private static string SanitizePathSegment(string name)
+    {
+        var s = new string(name.Select(ch =>
+            char.IsLetterOrDigit(ch) || ch is '_' or '-' ? ch : '_').ToArray());
+        if (string.IsNullOrWhiteSpace(s)) s = "model";
+        return s;
     }
 }

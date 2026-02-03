@@ -13,7 +13,7 @@ static class ObjWriter
         var objPath = Path.Combine(outDir, safe + ".obj");
         var mtlPath = Path.Combine(outDir, safe + ".mtl");
 
-        using (var mw = new StreamWriter(mtlPath, false, System.Text.Encoding.UTF8))
+        using (var mw = new StreamWriter(mtlPath, false, new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
         {
             if (mesh.Subsets.Count > 0 && mesh.MaterialSets.Count > 0)
             {
@@ -21,10 +21,17 @@ static class ObjWriter
                 foreach (var mid in used)
                 {
                     mw.WriteLine($"newmtl {safe}_mat{mid}");
+                    mw.WriteLine("Ka 1.000000 1.000000 1.000000");
                     mw.WriteLine("Kd 1.000000 1.000000 1.000000");
+                    mw.WriteLine("Ks 0.000000 0.000000 0.000000");
+                    mw.WriteLine("d 1.000000");
+                    mw.WriteLine("illum 1");
                     if (mesh.MaterialSets.TryGetValue(mid, out var ms))
                     {
                         if (!string.IsNullOrWhiteSpace(ms.ColorMap)) mw.WriteLine($"map_Kd {Path.GetFileName(ms.ColorMap)}");
+                    mw.WriteLine($"map_Ka {Path.GetFileName(ms.ColorMap)}");
+                    mw.WriteLine($"map_Ka {Path.GetFileName(ms.ColorMap)}");
+                        mw.WriteLine($"map_Ka {Path.GetFileName(ms.ColorMap)}");
                         if (!string.IsNullOrWhiteSpace(ms.NormalMap)) mw.WriteLine($"map_Bump {Path.GetFileName(ms.NormalMap)}");
                         if (!string.IsNullOrWhiteSpace(ms.LuminosityMap)) mw.WriteLine($"map_Ke {Path.GetFileName(ms.LuminosityMap)}");
                         if (!string.IsNullOrWhiteSpace(ms.ReflectionMap)) mw.WriteLine($"# ReflectionMap {Path.GetFileName(ms.ReflectionMap)}");
@@ -35,14 +42,21 @@ static class ObjWriter
             else
             {
                 mw.WriteLine($"newmtl {safe}_mat0");
+                mw.WriteLine("Ka 1.000000 1.000000 1.000000");
                 mw.WriteLine("Kd 1.000000 1.000000 1.000000");
+                mw.WriteLine("Ks 0.000000 0.000000 0.000000");
+                mw.WriteLine("d 1.000000");
+                mw.WriteLine("illum 1");
                 if (mesh.MaterialSets.TryGetValue(0, out var ms) && !string.IsNullOrWhiteSpace(ms.ColorMap))
                     mw.WriteLine($"map_Kd {Path.GetFileName(ms.ColorMap)}");
+                    mw.WriteLine($"map_Ka {Path.GetFileName(ms.ColorMap)}");
+                    mw.WriteLine($"map_Ka {Path.GetFileName(ms.ColorMap)}");
+                        mw.WriteLine($"map_Ka {Path.GetFileName(ms.ColorMap)}");
                 mw.WriteLine();
             }
         }
 
-        using (var ow = new StreamWriter(objPath, false, System.Text.Encoding.UTF8))
+        using (var ow = new StreamWriter(objPath, false, new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
         {
             ow.WriteLine($"mtllib {Path.GetFileName(mtlPath)}");
             ow.WriteLine($"o {safe}");
@@ -95,3 +109,5 @@ static class ObjWriter
         return s;
     }
 }
+
+

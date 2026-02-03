@@ -11,8 +11,11 @@ namespace ScnViewer;
 
 sealed class ViewerForm : Form
 {
-    private readonly MenuStrip _menu = new();
-    private readonly ToolStripMenuItem _open = new("Open...");
+    private const string AppTitle = "GalaxyAngel Model Tool";
+
+    private readonly ToolStrip _bar = new() { GripStyle = ToolStripGripStyle.Hidden, Stretch = true };
+    private readonly ToolStripButton _open = new("Open");
+    private readonly ToolStripButton _export = new("Export");
 
     private readonly TableLayoutPanel _layout = new()
     {
@@ -77,14 +80,15 @@ sealed class ViewerForm : Form
 
     public ViewerForm(string? initialPath)
     {
-        Text = "SCN Viewer";
+        Text = AppTitle;
         // 4:3 render area + right file list.
         ClientSize = new System.Drawing.Size(1280, 800);
 
-        _menu.Items.Add(_open);
-        MainMenuStrip = _menu;
+        _bar.Items.Add(_open);
+        _bar.Items.Add(_export);
+        _bar.Dock = DockStyle.Top;
         Controls.Add(_layout);
-        Controls.Add(_menu);
+        Controls.Add(_bar);
 
         _layout.ColumnStyles.Clear();
         _layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 1024));
@@ -101,6 +105,7 @@ sealed class ViewerForm : Form
         _layout.Controls.Add(_tabs, 1, 0);
 
         _open.Click += (_, _) => DoOpenFile();
+        _export.Click += (_, _) => DoExport();
         _list.SelectedIndexChanged += (_, _) => OnPickFile();
         _meshes.SelectedIndexChanged += (_, _) => OnPickMesh();
         _tree.AfterSelect += (_, e) => OnPickTree(e.Node);
@@ -118,7 +123,7 @@ sealed class ViewerForm : Form
             }
             catch (Exception ex)
             {
-                MessageBox.Show(this, ex.ToString(), "SCN Viewer - GL init failed",
+                MessageBox.Show(this, ex.ToString(), AppTitle,
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         };
@@ -149,6 +154,79 @@ sealed class ViewerForm : Form
         };
         if (dlg.ShowDialog(this) == DialogResult.OK)
             LoadFile(dlg.FileName);
+    }
+    private ExportDialog? _exportDialog;
+
+    private void DoExport()
+    {
+        var suggestedIn = _currentFolder;
+        var suggestedOut = (string?)null;
+
+        if (_exportDialog == null || _exportDialog.IsDisposed)
+        {
+            _exportDialog = new ExportDialog(suggestedIn, suggestedOut);
+            _exportDialog.ExportRequested += (_, _) => RunExportFromDialog();
+        }
+        else
+        {
+            _exportDialog.SetSuggestedInputFolder(suggestedIn);
+            _exportDialog.SetSuggestedOutputFolder(suggestedOut);
+        }
+
+        
+        CenterChildDialog(this, _exportDialog);
+        _exportDialog.Show(this);
+        _exportDialog.BringToFront();
+    }
+
+    private void RunExportFromDialog()
+    {
+        if (_exportDialog == null || _exportDialog.IsDisposed) return;
+
+        var inDir = _exportDialog.InputFolder;
+        var outRoot = _exportDialog.OutputFolder;
+
+        _exportDialog.SetBusy(true);
+        _export.Enabled = false;
+        _open.Enabled = false;
+
+        Task.Run(() =>
+        {
+            Converter.ConvertFolder(inDir, outRoot);
+            return outRoot;
+        }).ContinueWith(t =>
+        {
+            BeginInvoke(() =>
+            {
+                _exportDialog?.SetBusy(false);
+                _export.Enabled = true;
+                _open.Enabled = true;
+
+                if (t.IsFaulted)
+                {
+                    var msg = t.Exception?.GetBaseException().Message ?? "Export failed.";
+                    MessageBox.Show(this, msg, AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                MessageBox.Show(this, $"Export done: {t.Result}", AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            });
+        });
+    }
+    private static void CenterChildDialog(Form parent, Form child)
+    {
+        try
+        {
+            var p = parent.RectangleToScreen(parent.ClientRectangle);
+            var x = p.Left + Math.Max(0, (p.Width - child.Width) / 2);
+            var y = p.Top + Math.Max(0, (p.Height - child.Height) / 2);
+            child.StartPosition = FormStartPosition.Manual;
+            child.Location = new System.Drawing.Point(x, y);
+        }
+        catch
+        {
+            child.StartPosition = FormStartPosition.CenterParent;
+        }
     }
 
     private void LoadFile(string file)
@@ -224,13 +302,13 @@ sealed class ViewerForm : Form
             if (t.IsFaulted)
             {
                 var msg = t.Exception?.GetBaseException().Message ?? "Failed to load.";
-                BeginInvoke(() => MessageBox.Show(this, msg, "SCN Viewer", MessageBoxButtons.OK, MessageBoxIcon.Error));
+                BeginInvoke(() => MessageBox.Show(this, msg, AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Error));
                 return;
             }
             var (models, folder, file, magic, idx) = t.Result;
             if (models.Count == 0)
             {
-                BeginInvoke(() => MessageBox.Show(this, "Failed to parse this SCN file.", "SCN Viewer",
+                BeginInvoke(() => MessageBox.Show(this, "Failed to parse this SCN file.", AppTitle,
                     MessageBoxButtons.OK, MessageBoxIcon.Warning));
                 return;
             }
@@ -264,7 +342,7 @@ sealed class ViewerForm : Form
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show(this, ex.ToString(), "SCN Viewer - load failed",
+                    MessageBox.Show(this, ex.ToString(), AppTitle,
                         MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
             });
@@ -289,7 +367,7 @@ sealed class ViewerForm : Form
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, ex.ToString(), "SCN Viewer - load failed",
+            MessageBox.Show(this, ex.ToString(), AppTitle,
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
@@ -356,7 +434,7 @@ sealed class ViewerForm : Form
             v += _currentModels[i].Mesh.Positions.Length;
             f += _currentModels[i].Mesh.Indices.Length / 3;
         }
-        Text = $"SCN Viewer - {file} ({magic})  (v={v}, f={f})";
+        Text = $"{AppTitle} - {file} ({magic})  (v={v}, f={f})";
     }
 
     private static IReadOnlyCollection<int> ChooseDefaultVisibleModels(ScnParser.Scn1Index? idx, List<ScnModel> models)
@@ -532,7 +610,7 @@ sealed class ViewerForm : Form
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, ex.ToString(), "SCN Viewer - load failed",
+            MessageBox.Show(this, ex.ToString(), AppTitle,
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
@@ -606,3 +684,8 @@ sealed class ViewerForm : Form
         return tn;
     }
 }
+
+
+
+
+
