@@ -41,3 +41,10 @@ Notes:
 - GA1 Microsoft official `X` model format
 - GA1 PS2 `sc0` model format
 
+## Build (single EXE)
+
+Release publish is configured as a single self-contained EXE (win-x64).
+
+From the repo root:
+
+`dotnet publish -p:PublishProfile=SingleFile-win-x64`
