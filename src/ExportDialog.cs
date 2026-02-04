@@ -71,7 +71,7 @@ sealed class ExportDialog : Form
             !string.IsNullOrWhiteSpace(s_lastOutput) ? s_lastOutput :
             defaultOut;
 
-        _browseInput.Click += (_, _) => BrowseFolder(_input, "Select input folder (contains .scn)");
+        _browseInput.Click += (_, _) => BrowseFolder(_input, "Select input folder (contains .scn/.axo)");
         _browseOutput.Click += (_, _) => BrowseFolder(_output, "Select output folder");
 
         _export.Click += (_, _) =>

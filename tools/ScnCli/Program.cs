@@ -8,7 +8,7 @@ static class Program
         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
         if (args.Length != 1)
         {
-            Console.Error.WriteLine("Usage: ScnCli <path-to-.scn>");
+            Console.Error.WriteLine("Usage: ScnCli <path-to-model>");
             return 2;
         }
 
@@ -20,24 +20,15 @@ static class Program
             return 2;
         }
 
-        var magic = Encoding.ASCII.GetString(data, 0, 4);
-        List<ScnModel> models;
-        ScnParser.Scn0Index? scn0 = null;
-        if (magic == "SCN0")
-        {
-            scn0 = ScnParser.ParseScn0Index(path, data);
-            models = scn0.Models;
-        }
-        else if (magic == "SCN1")
-        {
-            models = ScnParser.ParseScn1All(path, data);
-        }
-        else
-        {
-            models = new List<ScnModel>();
-        }
+        var res = ModelLoader.Load(path, data);
+        var magic = res.Magic;
+        var models = res.Models;
 
         Console.WriteLine($"magic={magic} models={models.Count}");
+        if (magic.StartsWith("AXO", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.Write(AxoParser.DumpTopLevel(data));
+        }
         for (var i = 0; i < models.Count; i++)
         {
             var m = models[i];
@@ -65,6 +56,39 @@ static class Program
                     max.Z = Math.Max(max.Z, v.Z);
                 }
                 Console.WriteLine($"  bbox min=({min.X:F3},{min.Y:F3},{min.Z:F3}) max=({max.X:F3},{max.Y:F3},{max.Z:F3}) nanOrInf={nan}");
+            }
+
+            if (mesh.Indices.Length > 0)
+            {
+                var minI = uint.MaxValue;
+                var maxI = 0u;
+                var deg = 0;
+                var used = new HashSet<uint>();
+                for (var k = 0; k < mesh.Indices.Length; k++)
+                {
+                    var idx = mesh.Indices[k];
+                    used.Add(idx);
+                    if (idx < minI) minI = idx;
+                    if (idx > maxI) maxI = idx;
+                }
+                for (var t = 0; t + 2 < mesh.Indices.Length; t += 3)
+                {
+                    var i0 = (int)mesh.Indices[t + 0];
+                    var i1 = (int)mesh.Indices[t + 1];
+                    var i2 = (int)mesh.Indices[t + 2];
+                    if ((uint)i0 >= (uint)mesh.Positions.Length || (uint)i1 >= (uint)mesh.Positions.Length || (uint)i2 >= (uint)mesh.Positions.Length)
+                        continue;
+                    if (i0 == i1 || i1 == i2 || i0 == i2) { deg++; continue; }
+                    var p0 = mesh.Positions[i0];
+                    var p1 = mesh.Positions[i1];
+                    var p2 = mesh.Positions[i2];
+                    var a = p1 - p0;
+                    var b = p2 - p0;
+                    var c = OpenTK.Mathematics.Vector3.Cross(a, b);
+                    if (c.LengthSquared < 1e-10f) deg++;
+                }
+                if (minI == uint.MaxValue) minI = 0;
+                Console.WriteLine($"  idx tri={mesh.Indices.Length / 3} degTri={deg} idxMin={minI} idxMax={maxI} uniqueVtxUsed={used.Count}");
             }
             foreach (var s in m.Mesh.Subsets.OrderBy(s => s.StartTri))
             {
@@ -101,8 +125,9 @@ static class Program
             }
         }
 
-        if (magic == "SCN0" && scn0 is not null)
+        if (res.Scn0Index is not null)
         {
+            var scn0 = res.Scn0Index;
             Console.WriteLine($"[scn0] containers={scn0.Containers.Count} groups={scn0.Groups.Count} meshGroups={scn0.MeshTable.Count} extraEntries={scn0.ExtraTable.Count}");
 
             if (Environment.GetEnvironmentVariable("SCN_DUMP_AUTO") == "1")

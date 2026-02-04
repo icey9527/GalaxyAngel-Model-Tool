@@ -140,7 +140,9 @@ sealed class ViewerForm : Form
         {
             if (Directory.Exists(initialPath))
                 LoadFolder(initialPath);
-            else if (File.Exists(initialPath) && initialPath.EndsWith(".scn", StringComparison.OrdinalIgnoreCase))
+            else if (File.Exists(initialPath) &&
+                     (initialPath.EndsWith(".scn", StringComparison.OrdinalIgnoreCase) ||
+                      initialPath.EndsWith(".axo", StringComparison.OrdinalIgnoreCase)))
                 LoadFile(initialPath);
         }
     }
@@ -149,8 +151,8 @@ sealed class ViewerForm : Form
     {
         using var dlg = new OpenFileDialog
         {
-            Filter = "SCN files (*.scn)|*.scn|All files (*.*)|*.*",
-            Title = "Open SCN File",
+            Filter = "Model files (*.scn;*.axo)|*.scn;*.axo|SCN files (*.scn)|*.scn|AXO files (*.axo)|*.axo|All files (*.*)|*.*",
+            Title = "Open Model File",
         };
         if (dlg.ShowDialog(this) == DialogResult.OK)
             LoadFile(dlg.FileName);
@@ -255,7 +257,10 @@ sealed class ViewerForm : Form
     {
         _currentFolder = folder;
         _scnFiles.Clear();
-        _scnFiles.AddRange(Directory.EnumerateFiles(folder, "*.scn", SearchOption.AllDirectories)
+        // Keep "file list" generic even though the variable is historically named _scnFiles.
+        _scnFiles.AddRange(Directory.EnumerateFiles(folder, "*.*", SearchOption.AllDirectories)
+            .Where(p => p.EndsWith(".scn", StringComparison.OrdinalIgnoreCase) ||
+                        p.EndsWith(".axo", StringComparison.OrdinalIgnoreCase))
             .OrderBy(p => p, StringComparer.OrdinalIgnoreCase));
         _list.BeginUpdate();
         _list.Items.Clear();
@@ -285,18 +290,8 @@ sealed class ViewerForm : Form
         Task.Run(() =>
         {
             var data = File.ReadAllBytes(path);
-            var magic = data.Length >= 4 ? System.Text.Encoding.ASCII.GetString(data, 0, 4) : "";
-            if (magic == "SCN1")
-            {
-                var idx = ScnParser.ParseScn1Index(data);
-                return (idx.Models, folder: Path.GetDirectoryName(path) ?? ".", file: Path.GetFileName(path), magic, idx1: idx, idx0: (ScnParser.Scn0Index?)null);
-            }
-            if (magic == "SCN0")
-            {
-                var idx0 = ScnParser.ParseScn0Index(path, data);
-                return (idx0.Models, folder: Path.GetDirectoryName(path) ?? ".", file: Path.GetFileName(path), magic, idx1: (ScnParser.Scn1Index?)null, idx0);
-            }
-            return (new List<ScnModel>(), folder: Path.GetDirectoryName(path) ?? ".", file: Path.GetFileName(path), magic, idx1: (ScnParser.Scn1Index?)null, idx0: (ScnParser.Scn0Index?)null);
+            var lr = ModelLoader.Load(path, data);
+            return (lr.Models, folder: Path.GetDirectoryName(path) ?? ".", file: Path.GetFileName(path), lr.Magic, idx1: lr.Scn1Index, idx0: lr.Scn0Index);
         }, token).ContinueWith(t =>
         {
             if (t.IsCanceled || token.IsCancellationRequested) return;
@@ -309,8 +304,11 @@ sealed class ViewerForm : Form
             var (models, folder, file, magic, idx1, idx0) = t.Result;
             if (models.Count == 0)
             {
-                BeginInvoke(() => MessageBox.Show(this, "Failed to parse this SCN file.", AppTitle,
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning));
+                BeginInvoke(() =>
+                {
+                    MessageBox.Show(this, "Failed to parse this model file.", AppTitle,
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                });
                 return;
             }
             BeginInvoke(() =>

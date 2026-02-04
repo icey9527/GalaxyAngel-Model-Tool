@@ -15,45 +15,58 @@ static class Converter
             throw new DirectoryNotFoundException(inDir.FullName);
         outDir.Create();
 
-        var scnPaths = Directory.EnumerateFiles(inDir.FullName, "*.scn", SearchOption.AllDirectories)
+        var modelPaths = Directory.EnumerateFiles(inDir.FullName, "*.*", SearchOption.AllDirectories)
+            .Where(p => p.EndsWith(".scn", StringComparison.OrdinalIgnoreCase) ||
+                        p.EndsWith(".axo", StringComparison.OrdinalIgnoreCase))
             .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
         var errors = new List<string>();
-        foreach (var scnPath in scnPaths)
+        foreach (var modelPath in modelPaths)
         {
             try
             {
-                var data = File.ReadAllBytes(scnPath);
+                var data = File.ReadAllBytes(modelPath);
                 if (data.Length < 4) continue;
+
+                var isAxo = modelPath.EndsWith(".axo", StringComparison.OrdinalIgnoreCase);
                 var magic = System.Text.Encoding.ASCII.GetString(data, 0, 4);
-                if (magic != "SCN0" && magic != "SCN1") continue;
+                if (!isAxo && magic != "SCN0" && magic != "SCN1") continue;
 
-                var relative = Path.GetRelativePath(inDir.FullName, scnPath);
+                var relative = Path.GetRelativePath(inDir.FullName, modelPath);
                 var relativeDir = Path.GetDirectoryName(relative) ?? "";
-                var scnStem = Path.GetFileNameWithoutExtension(scnPath);
+                var stem = Path.GetFileNameWithoutExtension(modelPath);
 
-                // Output layout:
-                // out/<scn0|scn1>/<relativeDir>/<scnFileStem>/<modelName>/*.obj + textures
-                var scnDir = Path.Combine(
+                var outStemDir = Path.Combine(
                     outDir.FullName,
-                    magic.ToLowerInvariant(),
+                    isAxo ? "axo" : magic.ToLowerInvariant(),
                     relativeDir,
-                    scnStem);
+                    stem);
 
-                if (Directory.Exists(scnDir))
-                    Directory.Delete(scnDir, recursive: true);
-                Directory.CreateDirectory(scnDir);
+                if (Directory.Exists(outStemDir))
+                    Directory.Delete(outStemDir, recursive: true);
+                Directory.CreateDirectory(outStemDir);
 
-                var models = magic == "SCN1"
-                    ? ScnParser.ParseScn1All(scnPath, data)
-                    : ScnParser.ParseScn0All(scnPath, data);
+                var models = ModelLoader.Load(modelPath, data).Models;
 
                 if (models.Count == 0) continue;
 
-                var srcFolder = Path.GetDirectoryName(scnPath) ?? ".";
-                var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var srcFolder = Path.GetDirectoryName(modelPath) ?? ".";
 
+                if (isAxo)
+                {
+                    // AXO export layout:
+                    // out/axo/<relativeDir>/<axoStem>/<axoStem>.obj + <axoStem>.mtl + textures
+                    // Keep meshes as separate OBJ objects, but write them into a single OBJ file.
+                    foreach (var model in models)
+                        TexturePipeline.RewriteTexturesToPng(srcFolder, outStemDir, model.Mesh);
+                    ObjWriter.Write(outStemDir, stem, models);
+                    continue;
+                }
+
+                // SCN export layout:
+                // out/<scn0|scn1>/<relativeDir>/<scnStem>/<modelName>/*.obj + textures
+                var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var model in models)
                 {
                     var folderName = SanitizePathSegment(model.Name);
@@ -64,7 +77,7 @@ static class Converter
                         folderName = folderName + "_" + n;
                     }
 
-                    var modelDir = Path.Combine(scnDir, folderName);
+                    var modelDir = Path.Combine(outStemDir, folderName);
                     Directory.CreateDirectory(modelDir);
 
                     TexturePipeline.RewriteTexturesToPng(srcFolder, modelDir, model.Mesh);
@@ -73,7 +86,7 @@ static class Converter
             }
             catch (Exception ex)
             {
-                errors.Add($"{Path.GetFileName(scnPath)}: {ex.Message}");
+                errors.Add($"{Path.GetFileName(modelPath)}: {ex.Message}");
             }
         }
 

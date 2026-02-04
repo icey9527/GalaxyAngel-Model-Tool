@@ -33,6 +33,7 @@ sealed class Renderer
     private const bool UploadTransposed = false;
     private const bool UseAltMvpOrder = true; // matches assets we tested
     private const bool UpAxisIsZ = false;
+    private const float DefaultPointSize = 6.0f;
 
     private readonly List<GpuMesh> _gpuMeshes = new();
     private bool[] _visible = Array.Empty<bool>();
@@ -112,7 +113,7 @@ sealed class Renderer
                 Mesh = m,
                 Vao = GL.GenVertexArray(),
                 Vbo = GL.GenBuffer(),
-                Ebo = GL.GenBuffer(),
+                Ebo = m.Indices.Length > 0 ? GL.GenBuffer() : 0,
             };
             UploadMesh(gm, m);
             LoadMaterials(gm, m, folder);
@@ -249,8 +250,11 @@ sealed class Renderer
         GL.BindVertexArray(gm.Vao);
         GL.BindBuffer(BufferTarget.ArrayBuffer, gm.Vbo);
         GL.BufferData(BufferTarget.ArrayBuffer, interleaved.Length * sizeof(float), interleaved, BufferUsageHint.StaticDraw);
-        GL.BindBuffer(BufferTarget.ElementArrayBuffer, gm.Ebo);
-        GL.BufferData(BufferTarget.ElementArrayBuffer, mesh.Indices.Length * sizeof(uint), mesh.Indices, BufferUsageHint.StaticDraw);
+        if (gm.Ebo != 0 && mesh.Indices.Length > 0)
+        {
+            GL.BindBuffer(BufferTarget.ElementArrayBuffer, gm.Ebo);
+            GL.BufferData(BufferTarget.ElementArrayBuffer, mesh.Indices.Length * sizeof(uint), mesh.Indices, BufferUsageHint.StaticDraw);
+        }
 
         gm.SubsetUseBaseVertex = new bool[mesh.Subsets.Count];
         var ordered = mesh.Subsets.OrderBy(s => s.StartTri).ToList();
@@ -320,6 +324,18 @@ sealed class Renderer
             var gm = _gpuMeshes[mi];
             var mesh = gm.Mesh;
             GL.BindVertexArray(gm.Vao);
+
+            if (mesh.Indices.Length == 0)
+            {
+                BindMaterial(gm, 0);
+                var ps = DefaultPointSize;
+                var s = Environment.GetEnvironmentVariable("SCN_POINT_SIZE");
+                if (!string.IsNullOrWhiteSpace(s) && float.TryParse(s, out var v) && v > 0.1f && v < 200f)
+                    ps = v;
+                GL.PointSize(ps);
+                GL.DrawArrays(PrimitiveType.Points, 0, mesh.Positions.Length);
+                continue;
+            }
 
             if (mesh.Subsets.Count > 0)
             {

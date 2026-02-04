@@ -16,6 +16,9 @@ static class TexturePipeline
     // Defensive defaults: large textures + mipmaps can trigger driver instability on some systems.
     // Keep this conservative; allow override via env var SCN_TEX_MAX (e.g. 4096) and SCN_TEX_MIPMAP=1.
     private const int DefaultMaxTexDim = 2048;
+    // Some external tools (and some in-game textures) rely on alpha for cutouts; default to preserving alpha.
+    // If you need to ignore alpha (e.g. junk alpha causing dark/black appearance), set SCN_TEX_FORCE_OPAQUE=1.
+    private const string ForceOpaqueEnv = "SCN_TEX_FORCE_OPAQUE";
 
     public static void RewriteTexturesToPng(string srcDir, string outDir, ScnMesh mesh)
     {
@@ -41,7 +44,19 @@ static class TexturePipeline
 
         using var bmp = LoadBitmap32(src);
         if (bmp == null) return baseName;
-        bmp.Save(dst, DrawingImageFormat.Png);
+
+        // Preserve alpha by default; allow forcing opaque for pipelines that treat alpha as a multiply/visibility mask.
+        if (Environment.GetEnvironmentVariable(ForceOpaqueEnv) == "1")
+        {
+            var px = GetPixelsBgra32(bmp, out var w, out var h);
+            ForceOpaqueBgra32(px);
+            using var outBmp = BitmapFromBgra32(px, w, h);
+            outBmp.Save(dst, DrawingImageFormat.Png);
+        }
+        else
+        {
+            bmp.Save(dst, DrawingImageFormat.Png);
+        }
         return dstName;
     }
 
@@ -69,6 +84,9 @@ static class TexturePipeline
                     w = nw;
                     h = nh;
                 }
+
+                if (Environment.GetEnvironmentVariable(ForceOpaqueEnv) == "1")
+                    ForceOpaqueBgra32(pixels);
 
                 GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba8, w, h, 0,
                     GlPixelFormat.Bgra, PixelType.UnsignedByte, pixels);
@@ -197,6 +215,12 @@ static class TexturePipeline
     {
         var s = Environment.GetEnvironmentVariable(name);
         return int.TryParse(s, out var v) && v > 0 ? v : fallback;
+    }
+
+    private static void ForceOpaqueBgra32(byte[] bgra)
+    {
+        for (var i = 3; i < bgra.Length; i += 4)
+            bgra[i] = 255;
     }
 
     private static byte[] DownscaleNearestBgra32(byte[] src, int sw, int sh, int dw, int dh)
