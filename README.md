@@ -2,7 +2,7 @@
 
 UI viewer + OBJ exporter for:
 
-- Galaxy Angel 1 series (Moonlight Night Lover / Eternal Lover): `SCN0/SCN1` (`.scn`)
+- Galaxy Angel 1 series (Moonlit Lovers / Eternal Lover): `SCN0/SCN1` (`.scn`)
 - Galaxy Angel 2 series (PS2): `AXO` (`.axo`)
 
 ## Getting the files
