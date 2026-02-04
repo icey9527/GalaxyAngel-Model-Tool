@@ -36,7 +36,7 @@ static class ObjWriter
                             mw.WriteLine($"map_Ka {tex}");
                         }
                         if (!string.IsNullOrWhiteSpace(ms.NormalMap)) mw.WriteLine($"map_Bump {Path.GetFileName(ms.NormalMap)}");
-                        if (!string.IsNullOrWhiteSpace(ms.LuminosityMap)) mw.WriteLine($"map_Ke {Path.GetFileName(ms.LuminosityMap)}");
+                        // Avoid exporting LuminosityMap as emission; different tools interpret map_Ke inconsistently.
                         if (!string.IsNullOrWhiteSpace(ms.ReflectionMap)) mw.WriteLine($"# ReflectionMap {Path.GetFileName(ms.ReflectionMap)}");
                     }
                     mw.WriteLine();
@@ -143,7 +143,7 @@ static class ObjWriter
                             mw.WriteLine($"map_Ka {tex}");
                         }
                         if (!string.IsNullOrWhiteSpace(ms.NormalMap)) mw.WriteLine($"map_Bump {Path.GetFileName(ms.NormalMap)}");
-                        if (!string.IsNullOrWhiteSpace(ms.LuminosityMap)) mw.WriteLine($"map_Ke {Path.GetFileName(ms.LuminosityMap)}");
+                        // Avoid exporting LuminosityMap as emission; different tools interpret map_Ke inconsistently.
                         if (!string.IsNullOrWhiteSpace(ms.ReflectionMap)) mw.WriteLine($"# ReflectionMap {Path.GetFileName(ms.ReflectionMap)}");
                     }
                     mw.WriteLine();

@@ -61,12 +61,6 @@ static class Converter
                     foreach (var model in models)
                         TexturePipeline.RewriteTexturesToPng(srcFolder, outStemDir, model.Mesh);
 
-                    // If some referenced textures weren't copied (missing source .agi.png), write a small report
-                    // so it's obvious why external viewers show black.
-                    var missing = FindMissingTextures(outStemDir, models);
-                    if (missing.Count > 0)
-                        File.WriteAllLines(Path.Combine(outStemDir, "_missing_textures.txt"), missing);
-
                     ObjWriter.Write(outStemDir, stem, models);
                     continue;
                 }
@@ -107,31 +101,5 @@ static class Converter
             char.IsLetterOrDigit(ch) || ch is '_' or '-' ? ch : '_').ToArray());
         if (string.IsNullOrWhiteSpace(s)) s = "model";
         return s;
-    }
-
-    private static List<string> FindMissingTextures(string outDir, IReadOnlyList<ScnModel> models)
-    {
-        var missing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        static void CheckOne(HashSet<string> missing, string outDir, string? name)
-        {
-            if (string.IsNullOrWhiteSpace(name)) return;
-            var p = Path.Combine(outDir, Path.GetFileName(name));
-            if (!File.Exists(p))
-                missing.Add(Path.GetFileName(name));
-        }
-
-        foreach (var m in models)
-        {
-            foreach (var ms in m.Mesh.MaterialSets.Values)
-            {
-                CheckOne(missing, outDir, ms.ColorMap);
-                CheckOne(missing, outDir, ms.NormalMap);
-                CheckOne(missing, outDir, ms.LuminosityMap);
-                CheckOne(missing, outDir, ms.ReflectionMap);
-            }
-        }
-
-        return missing.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
     }
 }

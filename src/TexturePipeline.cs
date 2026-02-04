@@ -16,9 +16,6 @@ static class TexturePipeline
     // Defensive defaults: large textures + mipmaps can trigger driver instability on some systems.
     // Keep this conservative; allow override via env var SCN_TEX_MAX (e.g. 4096) and SCN_TEX_MIPMAP=1.
     private const int DefaultMaxTexDim = 2048;
-    // Some external tools (and some in-game textures) rely on alpha for cutouts; default to preserving alpha.
-    // If you need to ignore alpha (e.g. junk alpha causing dark/black appearance), set SCN_TEX_FORCE_OPAQUE=1.
-    private const string ForceOpaqueEnv = "SCN_TEX_FORCE_OPAQUE";
 
     public static void RewriteTexturesToPng(string srcDir, string outDir, ScnMesh mesh)
     {
@@ -45,18 +42,10 @@ static class TexturePipeline
         using var bmp = LoadBitmap32(src);
         if (bmp == null) return baseName;
 
-        // Preserve alpha by default; allow forcing opaque for pipelines that treat alpha as a multiply/visibility mask.
-        if (Environment.GetEnvironmentVariable(ForceOpaqueEnv) == "1")
-        {
-            var px = GetPixelsBgra32(bmp, out var w, out var h);
-            ForceOpaqueBgra32(px);
-            using var outBmp = BitmapFromBgra32(px, w, h);
-            outBmp.Save(dst, DrawingImageFormat.Png);
-        }
-        else
-        {
-            bmp.Save(dst, DrawingImageFormat.Png);
-        }
+        // Always strip alpha so external tools don't treat the texture as transparent.
+        var px = GetPixelsBgra32(bmp, out var w, out var h);
+        using var outBmp = BitmapFromBgr24(ToBgr24(px), w, h);
+        outBmp.Save(dst, DrawingImageFormat.Png);
         return dstName;
     }
 
@@ -85,11 +74,10 @@ static class TexturePipeline
                     h = nh;
                 }
 
-                if (Environment.GetEnvironmentVariable(ForceOpaqueEnv) == "1")
-                    ForceOpaqueBgra32(pixels);
-
-                GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba8, w, h, 0,
-                    GlPixelFormat.Bgra, PixelType.UnsignedByte, pixels);
+                // Upload as RGB8 so alpha cannot affect sampling/blending.
+                var bgr = ToBgr24(pixels);
+                GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgb8, w, h, 0,
+                    GlPixelFormat.Bgr, PixelType.UnsignedByte, bgr);
 
                 // Prefer no mipmaps by default; mipmap generation can be expensive and sometimes unstable on bad drivers.
                 var wantMips = Environment.GetEnvironmentVariable("SCN_TEX_MIPMAP") == "1";
@@ -217,10 +205,19 @@ static class TexturePipeline
         return int.TryParse(s, out var v) && v > 0 ? v : fallback;
     }
 
-    private static void ForceOpaqueBgra32(byte[] bgra)
+    private static byte[] ToBgr24(byte[] bgra)
     {
-        for (var i = 3; i < bgra.Length; i += 4)
-            bgra[i] = 255;
+        var pxCount = bgra.Length / 4;
+        var bgr = new byte[checked(pxCount * 3)];
+        for (var i = 0; i < pxCount; i++)
+        {
+            var si = i * 4;
+            var di = i * 3;
+            bgr[di + 0] = bgra[si + 0]; // B
+            bgr[di + 1] = bgra[si + 1]; // G
+            bgr[di + 2] = bgra[si + 2]; // R
+        }
+        return bgr;
     }
 
     private static byte[] DownscaleNearestBgra32(byte[] src, int sw, int sh, int dw, int dh)
@@ -253,6 +250,29 @@ static class TexturePipeline
         try
         {
             System.Runtime.InteropServices.Marshal.Copy(bgra, 0, data.Scan0, bgra.Length);
+        }
+        finally
+        {
+            bmp.UnlockBits(data);
+        }
+        return bmp;
+    }
+
+    private static Bitmap BitmapFromBgr24(byte[] bgr, int width, int height)
+    {
+        var bmp = new Bitmap(width, height, DrawingPixelFormat.Format24bppRgb);
+        var rect = new Rectangle(0, 0, width, height);
+        var data = bmp.LockBits(rect, ImageLockMode.WriteOnly, DrawingPixelFormat.Format24bppRgb);
+        try
+        {
+            var stride = data.Stride;
+            var rowBytes = checked(width * 3);
+            for (var y = 0; y < height; y++)
+            {
+                var srcOff = y * rowBytes;
+                var dst = data.Scan0 + y * stride;
+                System.Runtime.InteropServices.Marshal.Copy(bgr, srcOff, dst, rowBytes);
+            }
         }
         finally
         {
