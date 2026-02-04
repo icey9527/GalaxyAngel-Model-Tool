@@ -10,361 +10,749 @@ namespace ScnViewer;
 
 static partial class ScnParser
 {
+    public sealed record Scn0Index(
+        ScnTreeNodeInfo? Tree,
+        List<ScnContainerInfo> Containers,
+        List<ScnGroupEntry> Groups,
+        List<ScnModel> Models,
+        List<Scn0MeshTableGroup> MeshTable,
+        List<Scn0MeshTableEntry> ExtraTable);
+
     public static List<ScnModel> ParseScn0All(string path, byte[] data)
     {
-        var stem = System.IO.Path.GetFileNameWithoutExtension(path);
-        var baseHint = InferBaseHint(stem);
-        var treeEnd = ParseTreeEnd(data, 4);
+        // SCN0 must be parsed by structure (per decomp), not by scanning.
+        return ParseScn0Index(path, data).Models;
+    }
 
-        var blocks = ScanScn0Stride32Blocks(data, treeEnd, Math.Max(0, data.Length - treeEnd));
-        if (blocks.Count == 0) return new List<ScnModel>();
+    public static Scn0Index ParseScn0Index(string path, byte[] data)
+    {
+        // Verified by IDA (sub_100143E0 + sub_10014AE0 + sub_10014C50 + sub_10014E40):
+        //   "SCN0"
+        //   tree (node parser sub_10014AE0 consumes name_cstr + 0x40 + hasChild/hasSibling recursion)
+        //   u32 outerAutoCount + auto table (same element-size layout as SCN1 auto table)
+        //   a sequence of config dwords/bools
+        //   u32 pairCount + pairCount*(u32,u32)
+        //   3*u32
+        //   mesh table: groupCount=(pairCount+1); for each group: u32 entryCount; entries: cstring + u32 flag + size-prefixed payload
+        //   extra table: u32 count; entries: cstring + u32 flag + size-prefixed payload
+        //
+        // NOTE: We intentionally avoid any "scan for VB/IB" or "scan for decl signatures" at the file level.
 
-        var colorMaps = InferColorMapsFromStrings(data, baseHint);
+        var r = new ByteReader(data);
+        if (r.ReadAscii(4) != "SCN0") return new(null, new(), new(), new(), new(), new());
+
+        var (tree, treeBytes) = ParseTreeStrictInfo(data, r.Position);
+        r.Position += treeBytes;
+
+        // Auto table used by the loader (outer records / inner entries).
+        // We parse it structurally (per loader) and keep the subset-like records, because some files store
+        // texture bindings / subset ranges here instead of in the container's own subset records.
+        var autoTable = ParseAutoBlockTable(data, r.Position, out var autoBytes);
+        r.Position += autoBytes;
+
+        // Post-auto scalar fields (order matches SCN0 loader's sequential reads).
+        //
+        // Observed in SCN0 samples (sc06/ou06A.scn, ob101/ob101.scn):
+        //   u32[7] config values (some treated as bools/flags by the loader)
+        //   u32 pairCount
+        //
+        // NOTE: Earlier drafts assumed an extra standalone feature flag here, but in-file alignment shows
+        // the count immediately follows these 7 dwords for our current sample set.
+        if (r.Remaining < 4 * 8) return new(tree, new(), new(), new(), new(), new());
+        _ = r.ReadU32();
+        _ = r.ReadU32();
+        _ = r.ReadU32();
+        _ = r.ReadU32();
+        _ = r.ReadU32();
+        _ = r.ReadU32();
+        _ = r.ReadU32();
+
+        var pairCount = (int)r.ReadU32();
+        if (pairCount < 0 || pairCount > 200_000) return new(tree, new(), new(), new(), new(), new());
+        if (r.Remaining < pairCount * 8) return new(tree, new(), new(), new(), new(), new());
+        for (var i = 0; i < pairCount; i++)
+        {
+            _ = r.ReadU32();
+            _ = r.ReadU32();
+        }
+
+        if (r.Remaining < 12) return new(tree, new(), new(), new(), new(), new());
+        _ = r.ReadU32();
+        _ = r.ReadU32();
+        _ = r.ReadU32();
+
+        // Mesh table: groupCount = pairCount + 1 (as per `inc ebx; push ebx` before calling sub_10014C50).
+        var groupCount = pairCount + 1;
+        var meshTable = ParseScn0MeshTable(data, r.Position, groupCount, out var meshTableBytes);
+        r.Position += meshTableBytes;
+
+        // Extra table parsed by sub_10014E40: u32 count then entries (name + flag + payload).
+        var extraTable = ParseScn0ExtraTable(data, r.Position, out var extraBytes);
+        r.Position += extraBytes;
+
+        static Dictionary<string, List<Scn0AutoSubset>> BuildAutoSubsetMap(List<Scn0AutoOuter> t)
+        {
+            var map = new Dictionary<string, List<Scn0AutoSubset>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var o in t)
+            {
+                foreach (var e in o.Entries)
+                {
+                    if (string.IsNullOrWhiteSpace(e.Name)) continue;
+                    if (!map.TryGetValue(e.Name, out var list))
+                    {
+                        list = new List<Scn0AutoSubset>();
+                        map[e.Name] = list;
+                    }
+                    if (e.Subsets.Count > 0)
+                        list.AddRange(e.Subsets);
+                }
+            }
+            return map;
+        }
+
+        var autoSubsetsByName = BuildAutoSubsetMap(autoTable);
+
+        // Build models from the mesh table payload blocks (each payload is a size-prefixed container block).
+        // SCN0 containers use an older mesh format (decl_bitfield + VB/IB + subset records), see `sub_10004700`.
         var models = new List<ScnModel>();
-        var faceCounts = new Dictionary<Scn0Stride32Block, int>();
-
-        // Sort by vertex count (high -> low), matching the viewer's usual "high first" behavior.
-        var ordered = blocks
-            .OrderByDescending(b => b.VertexCount)
-            .ThenByDescending(b => b.TriangleCount)
-            .ToList();
-
-        for (var i = 0; i < ordered.Count; i++)
+        var containers = new List<ScnContainerInfo>();
+        var groups = new List<ScnGroupEntry>();
+        var containerIndex = 0;
+        foreach (var g in meshTable)
         {
-            var b = ordered[i];
-            var mesh = DecodeStride32(data, b);
-            mesh.MaterialSets = colorMaps.ToDictionary(kv => kv.Key, kv => new ScnMaterialSet { ColorMap = kv.Value });
-
-            if (mesh.MaterialSets.Count > 1 && mesh.Indices.Length > 0)
+            foreach (var e in g.Entries)
             {
-                var faceCount = mesh.Indices.Length / 3;
-                var vcount = mesh.Positions.Length;
-                mesh.Subsets = InferScn0SubsetsFromTextureStrings(data, vcount, faceCount, mesh.MaterialSets);
-            }
+                var container = e.Payload.ToArray();
+                var cname = ReadFixedName20(container);
+                containers.Add(new ScnContainerInfo(containerIndex, cname));
+                groups.Add(new ScnGroupEntry(g.GroupIndex, containerIndex, e.Name));
 
-            if (mesh.Subsets.Count == 0 && mesh.MaterialSets.Count > 1)
-            {
-                var first = mesh.MaterialSets.OrderBy(k => k.Key).First();
-                mesh.MaterialSets = new Dictionary<int, ScnMaterialSet> { [0] = first.Value };
-            }
+                List<Scn0AutoSubset>? autoSubsets = null;
+                if (autoSubsetsByName.TryGetValue(cname, out var byContainer))
+                    autoSubsets = byContainer;
+                else if (autoSubsetsByName.TryGetValue(e.Name, out var byEntry))
+                    autoSubsets = byEntry;
 
-            var name = ordered.Count == 1 ? stem : $"{stem}_{i}";
-            models.Add(new ScnModel(name, mesh));
-        }
-
-        return models;
-    }
-    public static ScnMesh? ParseScn0High(string path, byte[] data)
-    {
-        var stem = System.IO.Path.GetFileNameWithoutExtension(path);
-        var baseHint = InferBaseHint(stem);
-        var treeEnd = ParseTreeEnd(data, 4);
-
-        var blocks = ScanScn0Stride32Blocks(data, treeEnd, Math.Max(0, data.Length - treeEnd));
-        if (blocks.Count == 0) return null;
-        // SCN0: prefer embedded filename strings (usually .dds families like ...E_0.dds/...E_1.dds)
-        // for the high mesh blocks. auto-blocks can refer to .bmp variants and are not reliable here.
-        var colorMaps = InferColorMapsFromStrings(data, baseHint);
-
-        var bestBlock = blocks
-            .OrderByDescending(b => b.VertexCount)
-            .ThenByDescending(b => b.TriangleCount)
-            .First();
-
-        var outMesh = DecodeStride32(data, bestBlock);
-        outMesh.MaterialSets = colorMaps.ToDictionary(kv => kv.Key, kv => new ScnMaterialSet { ColorMap = kv.Value });
-
-        if (outMesh.MaterialSets.Count > 1 && outMesh.Indices.Length > 0)
-        {
-            var faceCount = outMesh.Indices.Length / 3;
-            var vcount = outMesh.Positions.Length;
-            outMesh.Subsets = InferScn0SubsetsFromTextureStrings(data, vcount, faceCount, outMesh.MaterialSets);
-        }
-
-        if (outMesh.Subsets.Count == 0 && outMesh.MaterialSets.Count > 1)
-        {
-            var first = outMesh.MaterialSets.OrderBy(k => k.Key).First();
-            outMesh.MaterialSets = new Dictionary<int, ScnMaterialSet> { [0] = first.Value };
-        }
-
-        return outMesh;
-    }
-
-
-    // --- SCN0 stride32 high block ---
-
-    private sealed record Scn0Stride32Block(int Offset, int VertexCount, int TriangleCount, int VbOff, int IbOff, int IbBytes);
-
-    private static List<Scn0Stride32Block> ScanScn0Stride32Blocks(byte[] data, int start, int window)
-    {
-        const int stride = 32;
-        var list = new List<Scn0Stride32Block>();
-        var end = Math.Min(data.Length, start + window);
-        for (var off = start; off < end - 16; off++)
-        {
-            var vcount = (int)ReadU32(data, off);
-            if (vcount < 3 || vcount > 2_000_000) continue;
-            var vbOff = off + 4;
-            var vbSize = vcount * stride;
-            var tagOff = vbOff + vbSize;
-            if (tagOff + 8 >= data.Length) continue;
-            var tag = (int)ReadU32(data, tagOff);
-            if (tag != 101 && tag != 102) continue;
-            var ibBytes = (int)ReadU32(data, tagOff + 4);
-            if (ibBytes < 6 || (ibBytes % 2) != 0) continue;
-            var ibOff = tagOff + 8;
-            if (ibOff + ibBytes > data.Length) continue;
-            var idxCount = ibBytes / 2;
-            if ((idxCount % 3) != 0) continue;
-            var sample = Math.Min(10, idxCount);
-            var ok = true;
-            for (var i = 0; i < sample; i++)
-            {
-                var idx = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(ibOff + i * 2, 2));
-                if (idx >= vcount) { ok = false; break; }
-            }
-            if (!ok) continue;
-            list.Add(new Scn0Stride32Block(off, vcount, idxCount / 3, vbOff, ibOff, ibBytes));
-        }
-        return list;
-    }
-
-    private static ScnMesh DecodeStride32(byte[] data, Scn0Stride32Block b)
-    {
-        const int stride = 32;
-        var positions = new Vector3[b.VertexCount];
-        var normals = new Vector3[b.VertexCount];
-        var uvs = new Vector2[b.VertexCount];
-        for (var i = 0; i < b.VertexCount; i++)
-        {
-            var at = b.VbOff + i * stride;
-            var x = ReadF32(data, at + 0);
-            var y = ReadF32(data, at + 4);
-            var z = ReadF32(data, at + 8);
-            var nx = ReadF32(data, at + 12);
-            var ny = ReadF32(data, at + 16);
-            var nz = ReadF32(data, at + 20);
-            var u = ReadF32(data, at + 24);
-            var v = 1.0f - ReadF32(data, at + 28);
-            positions[i] = new Vector3(x, y, z);
-            normals[i] = new Vector3(nx, ny, nz);
-            uvs[i] = new Vector2(u, v);
-        }
-
-        var idxCount = b.IbBytes / 2;
-        var indices = new uint[idxCount];
-        for (var i = 0; i < idxCount; i++)
-            indices[i] = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(b.IbOff + i * 2, 2));
-
-        return new ScnMesh { Positions = positions, Normals = normals, UVs = uvs, Indices = indices };
-    }
-
-    // --- SCN0 textures/subsets ---
-
-    private static string? InferBaseHint(string stem)
-        => stem.Length >= 4 && char.IsLetter(stem[0]) && char.IsLetter(stem[1]) && char.IsDigit(stem[2]) && char.IsDigit(stem[3])
-            ? stem.Substring(0, 4)
-            : null;
-
-    private static Dictionary<int, string> InferColorMapsFromStrings(byte[] data, string? baseHint)
-    {
-        var byPrefix = new Dictionary<string, Dictionary<int, string>>(StringComparer.OrdinalIgnoreCase);
-        for (var i = 0; i < data.Length - 5; i++)
-        {
-            var b = data[i];
-            if (b < 32 || b >= 127) continue;
-            var j = i;
-            while (j < data.Length && data[j] != 0 && data[j] >= 32 && data[j] < 127 && (j - i) < 260) j++;
-            if (j >= data.Length || data[j] != 0) continue;
-            if (j - i < 4) { i = j; continue; }
-            var s = System.Text.Encoding.ASCII.GetString(data, i, j - i);
-            var dot = s.LastIndexOf('.');
-            var us = s.LastIndexOf('_');
-            if (dot < 0 || us <= 0 || us >= dot) { i = j; continue; }
-            if (!int.TryParse(s.AsSpan(us + 1, dot - (us + 1)), NumberStyles.Integer, CultureInfo.InvariantCulture, out var idx))
-            { i = j; continue; }
-            if (idx is < 0 or > 999) { i = j; continue; }
-            var prefix = s.Substring(0, us);
-            if (!byPrefix.TryGetValue(prefix, out var d)) byPrefix[prefix] = d = new Dictionary<int, string>();
-            d[idx] = s;
-            i = j;
-        }
-        if (byPrefix.Count == 0) return new Dictionary<int, string>();
-
-        string? chosen = null;
-        if (!string.IsNullOrWhiteSpace(baseHint))
-        {
-            foreach (var suf in new[] { "E", "U", "" })
-            {
-                var cand = baseHint + suf;
-                if (byPrefix.ContainsKey(cand)) { chosen = cand; break; }
-            }
-        }
-        chosen ??= byPrefix.OrderByDescending(kv => kv.Value.Count).ThenBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase).First().Key;
-        return byPrefix[chosen].OrderBy(kv => kv.Key).ToDictionary(kv => kv.Key, kv => kv.Value);
-    }
-
-    private static List<ScnSubset> InferSubsetsNearTextures(byte[] data, int vcount, int faceCount, Dictionary<int, string> colorMaps)
-    {
-        var subsets = new List<ScnSubset>();
-        foreach (var (mid, tex) in colorMaps.OrderBy(kv => kv.Key))
-        {
-            var needle = System.Text.Encoding.ASCII.GetBytes(tex + "\0");
-            var pos = IndexOf(data, needle, 0);
-            if (pos < 0) continue;
-            if (TryInferSubsetNearOffset(data, pos, mid, out var subset))
-                subsets.Add(subset);
-        }
-        return subsets.OrderBy(s => s.StartTri).ThenBy(s => s.MaterialId).ToList();
-    }
-
-    private sealed record AutoBlock(int Offset, ScnMaterialSet Set);
-    private sealed record Scn0MatPick(int MaterialId, int AnchorOffset, ScnMaterialSet Set);
-
-    private static List<Scn0MatPick> ChooseScn0MaterialPicks(List<AutoBlock> autoBlocks, string? baseHint)
-    {
-        var blocks = autoBlocks.Where(b => !string.IsNullOrWhiteSpace(b.Set.ColorMap)).ToList();
-        if (blocks.Count == 0) return new List<Scn0MatPick>();
-
-        IEnumerable<AutoBlock> filtered = blocks;
-        if (!string.IsNullOrWhiteSpace(baseHint))
-        {
-            var baseNameE = baseHint + "E";
-            var baseNameU = baseHint + "U";
-            var e = blocks.Where(b => StartsWithIgnoreCase(System.IO.Path.GetFileName(b.Set.ColorMap!), baseNameE)).ToList();
-            if (e.Count > 0) filtered = e;
-            else
-            {
-                var u = blocks.Where(b => StartsWithIgnoreCase(System.IO.Path.GetFileName(b.Set.ColorMap!), baseNameU)).ToList();
-                if (u.Count > 0) filtered = u;
+                var embedded = ExtractScn0MeshBlobsFromContainer(container, autoSubsets);
+                for (var mi = 0; mi < embedded.Count; mi++)
+                {
+                    var m = embedded[mi];
+                    // Prefer the container header name as the model name (e.g. "ou01E"/"ou01U").
+                    // Do not fall back to the mesh-table entry name here; if a container has no name,
+                    // the UI will display it as <no-name>#N.
+                    var nm = embedded.Count == 1 ? cname : $"{cname}#{mi}";
+                    models.Add(new ScnModel(nm, m, ContainerIndex: containerIndex, EmbeddedIndex: mi, GroupIndex: g.GroupIndex));
+                }
+                containerIndex++;
             }
         }
 
-        var bestByColor = new Dictionary<string, AutoBlock>(StringComparer.OrdinalIgnoreCase);
-        foreach (var b in filtered)
+        // Extra table (`sub_10014E40`) payloads are loaded by the original code as additional resources.
+        // Some files place additional mesh containers here; decode them only when they match the SCN0 container
+        // shape strictly (size-prefixed header + plausible mesh blob).
+        const int extraGroupIndex = -2;
+        for (var i = 0; i < extraTable.Count; i++)
         {
-            var key = System.IO.Path.GetFileName(b.Set.ColorMap!);
-            if (!bestByColor.TryGetValue(key, out var cur) || ScoreMaterialSet(b.Set) > ScoreMaterialSet(cur.Set))
-                bestByColor[key] = b;
+            var e = extraTable[i];
+            var container = e.Payload.ToArray();
+            if (!LooksLikeScn0ContainerBlock(container)) continue;
+
+            var cname = ReadFixedName20(container);
+            containers.Add(new ScnContainerInfo(containerIndex, cname));
+            groups.Add(new ScnGroupEntry(extraGroupIndex, containerIndex, e.Name));
+
+            List<Scn0AutoSubset>? autoSubsets = null;
+            if (autoSubsetsByName.TryGetValue(cname, out var byContainer))
+                autoSubsets = byContainer;
+            else if (autoSubsetsByName.TryGetValue(e.Name, out var byEntry))
+                autoSubsets = byEntry;
+
+            var embedded = ExtractScn0MeshBlobsFromContainer(container, autoSubsets);
+            if (embedded.Count == 0)
+            {
+                // Not a mesh container => do not add a placeholder entry.
+                containers.RemoveAt(containers.Count - 1);
+                groups.RemoveAt(groups.Count - 1);
+                continue;
+            }
+
+            for (var mi = 0; mi < embedded.Count; mi++)
+            {
+                var m = embedded[mi];
+                var nm = embedded.Count == 1 ? cname : $"{cname}#{mi}";
+                models.Add(new ScnModel(nm, m, ContainerIndex: containerIndex, EmbeddedIndex: mi, GroupIndex: extraGroupIndex));
+            }
+            containerIndex++;
         }
 
-        var ordered = bestByColor.Values
-            .Select(b =>
-            {
-                var idx = TryParseTrailingIndex(System.IO.Path.GetFileName(b.Set.ColorMap!), out var n) ? n : int.MaxValue;
-                return (idx, name: System.IO.Path.GetFileName(b.Set.ColorMap!), b);
-            })
-            .OrderBy(t => t.idx)
-            .ThenBy(t => t.name, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        return new Scn0Index(tree, containers, groups, models, meshTable, extraTable);
+    }
 
-        var outList = new List<Scn0MatPick>();
-        for (var i = 0; i < ordered.Count; i++)
-            outList.Add(new Scn0MatPick(i, ordered[i].b.Offset, ordered[i].b.Set));
+    private static bool LooksLikeScn0ContainerBlock(ReadOnlySpan<byte> container)
+    {
+        const int nameBufSize = 0x20;
+        const int headerSize = 8 + nameBufSize; // 0x28
+        if (container.Length < headerSize + 8) return false;
+
+        var size = (int)ReadU32(container, 0);
+        if (size != container.Length) return false;
+
+        var nameSpan = container.Slice(8, nameBufSize);
+        var nul = nameSpan.IndexOf((byte)0);
+        if (nul == 0) return false;
+
+        var decl = ReadU32(container, headerSize + 0);
+        var vcount = (int)ReadU32(container, headerSize + 4);
+        if (vcount <= 0 || vcount > 5_000_000) return false;
+        var stride = Scn0StrideFromDeclBitfield(decl);
+        if (stride <= 0 || stride > 1024) return false;
+        var vbBytes = (long)vcount * stride;
+        return vbBytes > 0 && headerSize + 8 + vbBytes <= container.Length;
+    }
+
+    private static string ReadFixedName20(byte[] container)
+    {
+        // SCN0 container header stores name in a fixed 0x20 buffer at offset 8.
+        if (container.Length < 8 + 0x20) return "";
+        var span = container.AsSpan(8, 0x20);
+        var nul = span.IndexOf((byte)0);
+        if (nul < 0) nul = span.Length;
+        return ScnEncoding.GetString(span.Slice(0, nul));
+    }
+
+    private sealed record Scn0AutoOuter(string Name, List<Scn0AutoInner> Entries);
+    private sealed record Scn0AutoSubset(int MaterialId, int StartTri, int TriCount, int BaseV, int VertexCount, string TextureName);
+    private sealed record Scn0AutoInner(string Name, uint Flag, List<Scn0AutoSubset> Subsets);
+
+    private static List<Scn0AutoOuter> ParseAutoBlockTable(byte[] data, int start, out int bytesConsumed)
+    {
+        // This matches the serialized shape consumed by the loader loop in sub_100143E0:
+        //   u32 outerCount
+        //   repeat outerCount:
+        //     outerName_cstr
+        //     u32 innerCount
+        //     repeat innerCount:
+        //       innerName_cstr
+        //       u32 flag
+        //       u32 c1; skip 16*c1
+        //       u32 c2; skip 20*c2
+        //       u32 c3; skip 16*c3
+        //       u32 c4; read c4 * 0x68 records (same size as SCN0 subset records)
+        //
+        // We keep the c4 records because they can contain subset ranges and texture names for some files.
+        // This is still strict: the loader consumes these records structurally (no scanning).
+        var pos = start;
+        bytesConsumed = 0;
+        if (pos + 4 > data.Length) return new();
+        var outer = (int)ReadU32(data, pos);
+        pos += 4;
+        var outList = new List<Scn0AutoOuter>(Math.Clamp(outer, 0, 2048));
+        if (outer < 0 || outer > 1_000_000) { bytesConsumed = 0; return new(); }
+
+        for (var i = 0; i < outer && pos < data.Length; i++)
+        {
+            var outerName = ReadCString(data, ref pos);
+            if (pos + 4 > data.Length) break;
+            var inner = (int)ReadU32(data, pos);
+            pos += 4;
+            if (inner < 0 || inner > 1_000_000) break;
+
+            var entries = new List<Scn0AutoInner>(Math.Clamp(inner, 0, 4096));
+            for (var j = 0; j < inner && pos < data.Length; j++)
+            {
+                var name = ReadCString(data, ref pos);
+                if (pos + 4 > data.Length) break;
+                var flag = ReadU32(data, pos);
+                pos += 4;
+                if (pos + 4 > data.Length) break;
+                var c1 = ReadU32(data, pos); pos += 4; pos += 16 * (int)c1;
+                if (pos + 4 > data.Length) break;
+                var c2 = ReadU32(data, pos); pos += 4; pos += 20 * (int)c2;
+                if (pos + 4 > data.Length) break;
+                var c3 = ReadU32(data, pos); pos += 4; pos += 16 * (int)c3;
+                if (pos + 4 > data.Length) break;
+                var c4 = (int)ReadU32(data, pos); pos += 4;
+                if (c4 < 0 || c4 > 1_000_000) break;
+
+                var subsets = new List<Scn0AutoSubset>(Math.Clamp(c4, 0, 4096));
+                for (var k = 0; k < c4; k++)
+                {
+                    if (pos + 0x68 > data.Length) break;
+                    var rec = data.AsSpan(pos, 0x68);
+                    pos += 0x68;
+
+                    // Subset-ish fields match the SCN0 subset record layout (same size 0x68):
+                    // +0x44: matId,startTri,triCount,baseV,vCnt
+                    // +0x58: texName[16]
+                    var matId = (int)ReadU32(rec, 0x44);
+                    var startTri = (int)ReadU32(rec, 0x48);
+                    var triCount = (int)ReadU32(rec, 0x4C);
+                    var baseV = (int)ReadU32(rec, 0x50);
+                    var vCnt = (int)ReadU32(rec, 0x54);
+                    var texNameSpan = rec.Slice(0x58, 16);
+                    var end = texNameSpan.IndexOf((byte)0);
+                    if (end < 0) end = 16;
+                    var tex = Encoding.ASCII.GetString(texNameSpan.Slice(0, end));
+
+                    // Keep even empty names; consumers may only need ranges.
+                    subsets.Add(new Scn0AutoSubset(matId, startTri, triCount, baseV, vCnt, tex));
+                }
+
+                entries.Add(new Scn0AutoInner(name, flag, subsets));
+            }
+
+            outList.Add(new Scn0AutoOuter(outerName, entries));
+        }
+
+        bytesConsumed = Math.Max(0, pos - start);
         return outList;
     }
 
-    private static int ScoreMaterialSet(ScnMaterialSet s)
-    {
-        var score = 0;
-        if (!string.IsNullOrWhiteSpace(s.ColorMap)) score += 1;
-        if (!string.IsNullOrWhiteSpace(s.NormalMap)) score += 1;
-        if (!string.IsNullOrWhiteSpace(s.LuminosityMap)) score += 1;
-        if (!string.IsNullOrWhiteSpace(s.ReflectionMap)) score += 1;
-        return score;
-    }
+    public sealed record Scn0MeshTableGroup(int GroupIndex, List<Scn0MeshTableEntry> Entries);
+    public sealed record Scn0MeshTableEntry(string Name, int Flag, ReadOnlyMemory<byte> Payload);
 
-    private static bool TryParseTrailingIndex(string name, out int idx)
+    private static List<Scn0MeshTableGroup> ParseScn0MeshTable(byte[] data, int start, int groupCount, out int bytesConsumed)
     {
-        idx = 0;
-        var dot = name.LastIndexOf('.');
-        var us = name.LastIndexOf('_');
-        if (dot < 0 || us <= 0 || us >= dot) return false;
-        return int.TryParse(name.AsSpan(us + 1, dot - (us + 1)), NumberStyles.Integer, CultureInfo.InvariantCulture, out idx);
-    }
-
-    private static bool StartsWithIgnoreCase(string s, string prefix)
-        => s.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
-
-    private static bool TryInferSubsetNearOffset(byte[] data, int pos, int materialId, out ScnSubset subset)
-    {
-        subset = default;
-        var bestTri = -1;
-        var bestV = -1;
-        var back = Math.Max(0, pos - 64);
-        for (var ofs = pos - 16; ofs >= back; ofs -= 4)
+        // Matches `sub_10014C50`'s stream consumption:
+        // - groupCount is *not* stored in the file; it is passed in from caller as (pairCount + 1).
+        // - For each group:
+        //   u32 entryCount
+        //   repeat entryCount:
+        //     name_cstr
+        //     u32 flag
+        //     payload: size-prefixed block (u32 size includes itself)
+        var pos = start;
+        var groups = new List<Scn0MeshTableGroup>(Math.Clamp(groupCount, 0, 8192));
+        for (var gi = 0; gi < groupCount; gi++)
         {
-            if (ofs < 0 || ofs + 16 > data.Length) continue;
-            var startTri = (int)ReadU32(data, ofs + 0);
-            var triCount = (int)ReadU32(data, ofs + 4);
-            var baseV = (int)ReadU32(data, ofs + 8);
-            var vCnt = (int)ReadU32(data, ofs + 12);
-            if (triCount <= 0 || vCnt <= 0) continue;
-            if (startTri < 0 || baseV < 0) continue;
-            if (triCount > bestTri || (triCount == bestTri && vCnt > bestV))
+            if (pos + 4 > data.Length) break;
+            var entryCount = (int)ReadU32(data, pos);
+            pos += 4;
+            if (entryCount < 0 || entryCount > 200_000) break;
+
+            var entries = new List<Scn0MeshTableEntry>(Math.Clamp(entryCount, 0, 4096));
+            for (var ei = 0; ei < entryCount; ei++)
             {
-                bestTri = triCount;
-                bestV = vCnt;
-                subset = new ScnSubset(materialId, startTri, triCount, baseV, vCnt);
+                var name = ReadCString(data, ref pos);
+                if (pos + 4 > data.Length) { bytesConsumed = Math.Max(0, pos - start); return groups; }
+                var flag = (int)ReadU32(data, pos);
+                pos += 4;
+
+                if (pos + 4 > data.Length) { bytesConsumed = Math.Max(0, pos - start); return groups; }
+                var len = (int)ReadU32(data, pos);
+                if (len < 8 || pos + len > data.Length) { bytesConsumed = Math.Max(0, pos - start); return groups; }
+                var payload = data.AsMemory(pos, len);
+                pos += len;
+                entries.Add(new Scn0MeshTableEntry(name, flag, payload));
             }
+
+            groups.Add(new Scn0MeshTableGroup(gi, entries));
         }
-        return bestTri > 0;
+
+        bytesConsumed = Math.Max(0, pos - start);
+        return groups;
     }
 
-    private static List<ScnSubset> InferScn0SubsetsFromTextureStrings(
-        byte[] data,
-        int vcount,
-        int faceCount,
-        Dictionary<int, ScnMaterialSet> materialSets)
+    private static List<Scn0MeshTableEntry> ParseScn0ExtraTable(byte[] data, int start, out int bytesConsumed)
     {
+        // Matches `sub_10014E40` stream consumption:
+        //   u32 count
+        //   repeat:
+        //     name_cstr
+        //     u32 flag
+        //     payload: size-prefixed block (u32 size includes itself)
+        var pos = start;
+        bytesConsumed = 0;
+        if (pos + 4 > data.Length) return new();
+        var count = (int)ReadU32(data, pos);
+        pos += 4;
+        if (count < 0 || count > 500_000) return new();
+
+        var outList = new List<Scn0MeshTableEntry>(Math.Clamp(count, 0, 4096));
+        for (var i = 0; i < count; i++)
+        {
+            var name = ReadCString(data, ref pos);
+            if (pos + 4 > data.Length) break;
+            var flag = (int)ReadU32(data, pos);
+            pos += 4;
+            if (pos + 4 > data.Length) break;
+            var len = (int)ReadU32(data, pos);
+            if (len < 8 || pos + len > data.Length) break;
+            var payload = data.AsMemory(pos, len);
+            pos += len;
+            outList.Add(new Scn0MeshTableEntry(name, flag, payload));
+        }
+        bytesConsumed = Math.Max(0, pos - start);
+        return outList;
+    }
+    public static ScnMesh? ParseScn0High(string path, byte[] data)
+    {
+        var models = ParseScn0All(path, data);
+        if (models.Count == 0) return null;
+        return models
+            .Select(x => x.Mesh)
+            .OrderByDescending(m => m.Positions.Length)
+            .ThenByDescending(m => m.Indices.Length)
+            .FirstOrDefault();
+    }
+
+    // --- SCN0 container mesh blob (verified by IDA: sub_10004700 + sub_1002A207) ---
+
+    private static List<ScnMesh> ExtractScn0MeshBlobsFromContainer(byte[] container, List<Scn0AutoSubset>? autoSubsets)
+    {
+        // Container is size-prefixed. Observed SCN0SCEN containers store:
+        //   u32 size
+        //   u32 id/hash
+        //   char name[0x20] at offset 8 (NUL-terminated within the fixed buffer)
+        //   mesh blob begins immediately after the fixed header (0x28 bytes total)
+        //
+        // The mesh blob structure itself is exact (from `sub_10004700`):
+        //   u32 decl_bitfield
+        //   u32 vcount
+        //   u8  VB[vcount * stride(decl_bitfield)]
+        //   u32 tag (seen 101/102)
+        //   u32 ib_bytes
+        //   u8  IB[ib_bytes] (u16 indices)
+        //   u32 subsetCount
+        //   repeat subsetCount:
+        //     u8  record[0x68]
+        //     at record+0x44: u32 matId, startTri, triCount, baseV, vCnt
+        //     at record+0x58: char[16] textureName (NUL terminated)
+        var meshes = new List<ScnMesh>();
+        const int nameBufSize = 0x20;
+        const int headerSize = 8 + nameBufSize; // 0x28
+        if (container.Length < headerSize + 8) return meshes;
+
+        // Parse fixed container header (no scanning):
+        // - name is within a fixed-size buffer; remaining bytes are padding.
+        // This yields a deterministic mesh blob offset.
+        var nameSpan = container.AsSpan(8, nameBufSize);
+        var nul = nameSpan.IndexOf((byte)0);
+        if (nul < 0) nul = nameBufSize;
+        _ = ScnEncoding.GetString(nameSpan.Slice(0, nul)); // currently not used for decoding; kept for future mapping/debug.
+
+        // NOTE: Earlier drafts enforced that unused bytes in the fixed name buffer are 0. The original loader
+        // code path we matched in IDA reads a C-string and does not validate padding, so enforcing padding here
+        // can incorrectly drop containers from some files.
+
+        var meshOff = headerSize;
+        var decl = ReadU32(container, meshOff + 0);
+        var vcount = (int)ReadU32(container, meshOff + 4);
+        if (vcount <= 0 || vcount > 5_000_000) return meshes;
+        var stride = Scn0StrideFromDeclBitfield(decl);
+        if (stride <= 0 || stride > 1024) return meshes;
+
+        var vbOff = meshOff + 8;
+        var vbBytes = (long)vcount * stride;
+        if (vbBytes <= 0 || vbOff + vbBytes > container.Length) return meshes;
+
+        var idxHdrOff = vbOff + (int)vbBytes;
+        if (idxHdrOff + 8 > container.Length) return meshes;
+        var tag = ReadU32(container, idxHdrOff + 0);
+        var ibBytes = (int)ReadU32(container, idxHdrOff + 4);
+        if (ibBytes <= 0 || (ibBytes % 2) != 0) return meshes;
+        var ibOff = idxHdrOff + 8;
+        if ((long)ibOff + ibBytes > container.Length) return meshes;
+        var idxCount = ibBytes / 2;
+        if (idxCount < 3 || (idxCount % 3) != 0) return meshes;
+
+        var afterIb = ibOff + ibBytes;
+        if (afterIb + 4 > container.Length) return meshes;
+        var subsetCount = (int)ReadU32(container, afterIb);
+        if (subsetCount < 0 || subsetCount > 10_000) return meshes;
+
+        var subsetBase = afterIb + 4;
+        var subsetBytes = subsetCount * 0x68;
+        if (subsetBase + subsetBytes > container.Length) return meshes;
+
+        // Decode vertices using the D3D8 FVF rules implied by `decl_bitfield` (see `sub_1002A207` port).
+        if (!TryDecodeScn0Vertices(container.AsSpan(vbOff, (int)vbBytes), vcount, stride, decl, out var pos, out var nrm, out var uv))
+            throw new NotSupportedException($"SCN0 vertex decl unsupported: decl=0x{decl:X} stride={stride} vcount={vcount}");
+
+        for (var i = 0; i < vcount; i++)
+            uv[i].Y = 1f - uv[i].Y;
+
+        var indices = new uint[idxCount];
+        var maxIndex = 0u;
+        for (var i = 0; i < idxCount; i++)
+        {
+            var idx = BinaryPrimitives.ReadUInt16LittleEndian(container.AsSpan(ibOff + i * 2, 2));
+            if (idx > maxIndex) maxIndex = idx;
+            indices[i] = idx;
+        }
+        if (maxIndex >= (uint)vcount)
+            throw new InvalidDataException($"SCN0 indices out of range: maxIndex={maxIndex} vcount={vcount}");
+
         var subsets = new List<ScnSubset>();
-        if (vcount <= 0 || faceCount <= 0 || materialSets.Count == 0) return subsets;
+        var materialSets = new Dictionary<int, ScnMaterialSet>();
 
-        foreach (var (mid, ms) in materialSets.OrderBy(kv => kv.Key))
+        void AddSubset(int matId, int startTri, int triCount, int baseV, int vCnt, string? tex)
         {
-            var tex = ms.ColorMap;
-            if (string.IsNullOrWhiteSpace(tex)) continue;
-            var name = System.IO.Path.GetFileName(tex);
-            if (string.IsNullOrWhiteSpace(name)) continue;
-            var needle = System.Text.Encoding.ASCII.GetBytes(name + "\0");
-
-            var bestTri = -1;
-            var bestV = -1;
-            ScnSubset? best = null;
-
-            // A texture string can appear multiple times; take the best validated match.
-            for (var pos = IndexOf(data, needle, 0); pos >= 0; pos = IndexOf(data, needle, pos + 1))
-            {
-                var back = Math.Max(0, pos - 64);
-                for (var ofs = pos - 16; ofs >= back; ofs -= 4)
-                {
-                    if (ofs < 0 || ofs + 16 > data.Length) continue;
-                    var startTri = (int)ReadU32(data, ofs + 0);
-                    var triCount = (int)ReadU32(data, ofs + 4);
-                    var baseV = (int)ReadU32(data, ofs + 8);
-                    var vCnt = (int)ReadU32(data, ofs + 12);
-                    if (triCount <= 0 || vCnt <= 0) continue;
-                    if (startTri < 0 || baseV < 0) continue;
-                    if ((long)startTri + triCount > faceCount) continue;
-                    if ((long)baseV + vCnt > vcount) continue;
-                    if (Environment.GetEnvironmentVariable("SCN_DEBUG") == "1" && (startTri > faceCount || triCount > faceCount))
-                        Console.WriteLine($"  [dbg] SCN0 subset candidate passed? mat={mid} start={startTri} tri={triCount} baseV={baseV} vCnt={vCnt} faceCount={faceCount} vcount={vcount} pos=0x{pos:X} ofs=0x{ofs:X}");
-
-                    if (triCount > bestTri || (triCount == bestTri && vCnt > bestV))
-                    {
-                        bestTri = triCount;
-                        bestV = vCnt;
-                        best = new ScnSubset(mid, startTri, triCount, baseV, vCnt);
-                    }
-                }
-            }
-
-            if (best.HasValue)
-                subsets.Add(best.Value);
+            if (matId < 0 || matId > 4096) return;
+            if (triCount <= 0 || startTri < 0) return;
+            if (baseV < 0 || vCnt <= 0) return;
+            if ((long)baseV + vCnt > vcount) return;
+            if ((long)startTri + triCount > (idxCount / 3)) return;
+            subsets.Add(new ScnSubset(matId, startTri, triCount, baseV, vCnt));
+            if (!string.IsNullOrWhiteSpace(tex))
+                materialSets[matId] = new ScnMaterialSet { ColorMap = tex };
         }
 
-        return subsets.OrderBy(s => s.StartTri).ThenBy(s => s.MaterialId).ToList();
+        if (subsetCount > 0)
+        {
+            for (var i = 0; i < subsetCount; i++)
+            {
+                var recOff = subsetBase + i * 0x68;
+                var matId = (int)ReadU32(container, recOff + 0x44);
+                var startTri = (int)ReadU32(container, recOff + 0x48);
+                var triCount = (int)ReadU32(container, recOff + 0x4C);
+                var baseV = (int)ReadU32(container, recOff + 0x50);
+                var vCnt = (int)ReadU32(container, recOff + 0x54);
+
+                // 16-byte inline texture name at 0x58.
+                var texNameSpan = container.AsSpan(recOff + 0x58, 16);
+                var end = texNameSpan.IndexOf((byte)0);
+                if (end < 0) end = 16;
+                var tex = Encoding.ASCII.GetString(texNameSpan.Slice(0, end));
+                AddSubset(matId, startTri, triCount, baseV, vCnt, tex);
+            }
+        }
+        else if (autoSubsets != null && autoSubsets.Count > 0)
+        {
+            // Strict fallback: use loader-consumed auto-table records when the container has no subset records.
+            foreach (var s in autoSubsets)
+                AddSubset(s.MaterialId, s.StartTri, s.TriCount, s.BaseV, s.VertexCount, s.TextureName);
+        }
+
+        if (subsets.Count == 0)
+        {
+            // Some meshes (collision/helpers) have no subsets/materials.
+            materialSets[0] = new ScnMaterialSet();
+        }
+
+        subsets = subsets.OrderBy(s => s.StartTri).ThenBy(s => s.MaterialId).ToList();
+
+        meshes.Add(new ScnMesh
+        {
+            Positions = pos,
+            Normals = nrm,
+            UVs = uv,
+            Indices = indices,
+            Subsets = subsets,
+            MaterialSets = materialSets,
+        });
+
+        _ = tag; // kept for debugging/version checks if needed (101/102 observed).
+        return meshes;
     }
+
+    private static int Scn0StrideFromDeclBitfield(uint a1)
+    {
+        // Exact port of `sub_1002A207`.
+        var result = (a1 & 0xE) switch
+        {
+            2 => 12,
+            4 or 6 => 16,
+            8 => 20,
+            0xA => 24,
+            0xC => 28,
+            0xE => 32,
+            _ => 0,
+        };
+
+        if ((a1 & 0x10) != 0) result += 12;
+        if ((a1 & 0x20) != 0) result += 4;
+        if ((a1 & 0x40) != 0) result += 4;
+        if ((a1 & 0x80) != 0) result += 4;
+
+        var v2 = (int)((a1 >> 8) & 0xF);
+        var v3 = (a1 >> 16) & 0xFFFF;
+        if (v3 != 0)
+        {
+            for (; v2 > 0; v2--)
+            {
+                var t = (int)(v3 & 3);
+                result += t switch { 0 => 8, 1 => 12, 2 => 16, 3 => 4, _ => 0 };
+                v3 >>= 2;
+            }
+        }
+        else
+        {
+            result += 8 * v2;
+        }
+
+        return result;
+    }
+
+    private static bool TryDecodeScn0Vertices(ReadOnlySpan<byte> vb, int vcount, int stride, uint decl,
+        out Vector3[] pos, out Vector3[] nrm, out Vector2[] uv)
+    {
+        pos = Array.Empty<Vector3>();
+        nrm = Array.Empty<Vector3>();
+        uv = Array.Empty<Vector2>();
+
+        // decl_bitfield is passed to D3D8 as an FVF (SetVertexShader), and stride is computed by `sub_1002A207`
+        // which matches the D3DFVF stride rules (position mask + NORMAL/PSIZE/DIFFUSE/SPECULAR + TEXCOORDSIZE).
+        //
+        // We decode strictly by those rules, extracting only what the tool currently uses (pos/nrm/uv0).
+
+        var fvfStride = Scn0StrideFromDeclBitfield(decl);
+        if (fvfStride != stride) return false;
+        if (stride <= 0 || vcount <= 0) return false;
+        if (vb.Length < (long)vcount * stride) return false;
+
+        if (!TryGetFvfOffsets(decl, out var posOff, out var posKind, out var nrmOff, out var uv0Off, out var uv0Dim))
+            return false;
+
+        pos = new Vector3[vcount];
+        nrm = new Vector3[vcount];
+        uv = new Vector2[vcount];
+
+        for (var i = 0; i < vcount; i++)
+        {
+            var o = i * stride;
+
+            pos[i] = posOff >= 0 ? ReadFvfPosition(vb, o + posOff, posKind) : Vector3.Zero;
+            nrm[i] = nrmOff >= 0
+                ? new Vector3(ReadF32(vb, o + nrmOff + 0), ReadF32(vb, o + nrmOff + 4), ReadF32(vb, o + nrmOff + 8))
+                : new Vector3(0, 0, 1);
+
+            if (uv0Off >= 0 && uv0Dim >= 1)
+            {
+                var u = ReadF32(vb, o + uv0Off + 0);
+                var v = uv0Dim >= 2 ? ReadF32(vb, o + uv0Off + 4) : 0f;
+                uv[i] = new Vector2(u, v);
+            }
+            else
+            {
+                uv[i] = Vector2.Zero;
+            }
+        }
+
+        return true;
+    }
+
+    private enum FvfPositionKind
+    {
+        None = 0,
+        Xyz = 1,
+        Xyzrhw = 2,
+        Xyzb1 = 3,
+        Xyzb2 = 4,
+        Xyzb3 = 5,
+        Xyzb4 = 6,
+        Xyzb5 = 7,
+    }
+
+    private static Vector3 ReadFvfPosition(ReadOnlySpan<byte> vb, int at, FvfPositionKind kind)
+    {
+        // For XYZRHW / XYZB*, the first 3 floats are XYZ.
+        return kind switch
+        {
+            FvfPositionKind.Xyz or FvfPositionKind.Xyzrhw or
+            FvfPositionKind.Xyzb1 or FvfPositionKind.Xyzb2 or FvfPositionKind.Xyzb3 or FvfPositionKind.Xyzb4 or FvfPositionKind.Xyzb5
+                => new Vector3(ReadF32(vb, at + 0), ReadF32(vb, at + 4), ReadF32(vb, at + 8)),
+            _ => Vector3.Zero
+        };
+    }
+
+    private static bool TryGetFvfOffsets(uint decl,
+        out int posOff, out FvfPositionKind posKind,
+        out int nrmOff,
+        out int uv0Off, out int uv0Dim)
+    {
+        posOff = -1;
+        posKind = FvfPositionKind.None;
+        nrmOff = -1;
+        uv0Off = -1;
+        uv0Dim = 0;
+
+        var cursor = 0;
+
+        switch (decl & 0xEu)
+        {
+            case 0x2: // XYZ
+                posOff = cursor;
+                posKind = FvfPositionKind.Xyz;
+                cursor += 12;
+                break;
+            case 0x4: // XYZRHW
+                posOff = cursor;
+                posKind = FvfPositionKind.Xyzrhw;
+                cursor += 16;
+                break;
+            case 0x6: // XYZB1
+                posOff = cursor;
+                posKind = FvfPositionKind.Xyzb1;
+                cursor += 16;
+                break;
+            case 0x8: // XYZB2
+                posOff = cursor;
+                posKind = FvfPositionKind.Xyzb2;
+                cursor += 20;
+                break;
+            case 0xA: // XYZB3
+                posOff = cursor;
+                posKind = FvfPositionKind.Xyzb3;
+                cursor += 24;
+                break;
+            case 0xC: // XYZB4
+                posOff = cursor;
+                posKind = FvfPositionKind.Xyzb4;
+                cursor += 28;
+                break;
+            case 0xE: // XYZB5
+                posOff = cursor;
+                posKind = FvfPositionKind.Xyzb5;
+                cursor += 32;
+                break;
+            default:
+                return false;
+        }
+
+        if ((decl & 0x10u) != 0)
+        {
+            nrmOff = cursor;
+            cursor += 12;
+        }
+
+        if ((decl & 0x20u) != 0) cursor += 4; // PSIZE
+        if ((decl & 0x40u) != 0) cursor += 4; // DIFFUSE
+        if ((decl & 0x80u) != 0) cursor += 4; // SPECULAR
+
+        var texCount = (int)((decl >> 8) & 0xFu);
+        var texSizeBits = (uint)(decl >> 16); // HIWORD(decl), 2 bits per stage
+
+        for (var i = 0; i < texCount; i++)
+        {
+            var dim = 2;
+            if (texSizeBits != 0)
+            {
+                var t = (int)(texSizeBits & 3u);
+                dim = t switch { 0 => 2, 1 => 3, 2 => 4, 3 => 1, _ => 2 };
+                texSizeBits >>= 2;
+            }
+            else
+            {
+                dim = 2;
+            }
+
+            if (i == 0)
+            {
+                uv0Off = cursor;
+                uv0Dim = dim;
+            }
+
+            cursor += dim * 4;
+        }
+
+        return true;
+    }
+
+
+    // --- SCN0 textures/subsets ---
+
+    private sealed record AutoBlock(int Offset, ScnMaterialSet Set);
 
     private static List<AutoBlock> ExtractAutoBlocks(byte[] buf)
     {
@@ -572,40 +960,6 @@ static partial class ScnParser
 
             if (TryReadSubsetRanges(payload, start, subsetCount, vcount, faceCount, out var subs))
                 return subs;
-        }
-
-        // Fallback: Subset tables are not always located right before the decl block. Scan a wider area:
-        // - prefer around the decl for speed
-        // - but allow the whole payload as fallback
-        var preferredStart = Math.Max(0, declOff - 0x8000);
-        var preferredEnd = Math.Min(payload.Length, declOff + 0x20000);
-        static IEnumerable<int> ScanOffsets(int start, int endExclusive, int maxLen)
-        {
-            var end = Math.Min(endExclusive, maxLen - 4);
-            for (var off = Math.Max(0, start); off <= end; off += 4) yield return off;
-        }
-
-        foreach (var off in ScanOffsets(preferredStart, preferredEnd, payload.Length))
-        {
-            var subsetCount = (int)ReadU32(payload, off);
-            if (subsetCount <= 0 || subsetCount > 256) continue;
-            if (!TryReadSubsetRanges(payload, off, subsetCount, vcount, faceCount, out var subs)) continue;
-
-            // Prefer more coverage (some tables omit hidden/unused faces).
-            if (subs.Sum(s => s.TriCount) > best.Sum(s => s.TriCount))
-                best = subs;
-        }
-
-        if (best.Count == 0)
-        {
-            foreach (var off in ScanOffsets(0, payload.Length, payload.Length))
-            {
-                var subsetCount = (int)ReadU32(payload, off);
-                if (subsetCount <= 0 || subsetCount > 256) continue;
-                if (!TryReadSubsetRanges(payload, off, subsetCount, vcount, faceCount, out var subs)) continue;
-                if (subs.Sum(s => s.TriCount) > best.Sum(s => s.TriCount))
-                    best = subs;
-            }
         }
 
         return best;

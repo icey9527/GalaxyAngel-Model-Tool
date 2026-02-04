@@ -252,6 +252,30 @@ sealed class Renderer
         GL.BindBuffer(BufferTarget.ElementArrayBuffer, gm.Ebo);
         GL.BufferData(BufferTarget.ElementArrayBuffer, mesh.Indices.Length * sizeof(uint), mesh.Indices, BufferUsageHint.StaticDraw);
 
+        gm.SubsetUseBaseVertex = new bool[mesh.Subsets.Count];
+        var ordered = mesh.Subsets.OrderBy(s => s.StartTri).ToList();
+        for (var i = 0; i < ordered.Count; i++)
+        {
+            var s = ordered[i];
+            var start = Math.Max(0, s.StartTri) * 3;
+            var count = Math.Max(0, s.TriCount) * 3;
+            var end = Math.Min(mesh.Indices.Length, start + count);
+            var min = uint.MaxValue;
+            var max = 0u;
+            for (var k = start; k < end; k++)
+            {
+                var idx = mesh.Indices[k];
+                if (idx < min) min = idx;
+                if (idx > max) max = idx;
+            }
+            if (min == uint.MaxValue) min = 0;
+
+            // Only apply BaseVertex when indices are clearly relative to the subset:
+            // - min is 0
+            // - max fits inside the subset's declared vertex window
+            gm.SubsetUseBaseVertex[i] = s.BaseVertex != 0 && s.VertexCount > 0 && min == 0 && max < (uint)s.VertexCount;
+        }
+
         const int stride = 8 * sizeof(float);
         GL.EnableVertexAttribArray(0);
         GL.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, stride, 0);
@@ -267,7 +291,8 @@ sealed class Renderer
         GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
         if (_gpuMeshes.Count == 0) return;
 
-        GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
+        var wire = Environment.GetEnvironmentVariable("SCN_WIREFRAME") == "1";
+        GL.PolygonMode(MaterialFace.FrontAndBack, wire ? PolygonMode.Line : PolygonMode.Fill);
         GL.UseProgram(_program);
 
         var proj = Matrix4.CreatePerspectiveFieldOfView(
@@ -298,12 +323,14 @@ sealed class Renderer
 
             if (mesh.Subsets.Count > 0)
             {
-                foreach (var s in mesh.Subsets.OrderBy(s => s.StartTri))
+                var ordered = mesh.Subsets.OrderBy(s => s.StartTri).ToList();
+                for (var si = 0; si < ordered.Count; si++)
                 {
+                    var s = ordered[si];
                     BindMaterial(gm, s.MaterialId);
                     var elemOffset = (IntPtr)(s.StartTri * 3 * sizeof(uint));
                     var elemCount = s.TriCount * 3;
-                    if (s.BaseVertex != 0)
+                    if (gm.SubsetUseBaseVertex != null && (uint)si < (uint)gm.SubsetUseBaseVertex.Length && gm.SubsetUseBaseVertex[si])
                         GL.DrawElementsBaseVertex(PrimitiveType.Triangles, elemCount, DrawElementsType.UnsignedInt, elemOffset, s.BaseVertex);
                     else
                         GL.DrawElements(PrimitiveType.Triangles, elemCount, DrawElementsType.UnsignedInt, elemOffset);
@@ -321,6 +348,15 @@ sealed class Renderer
 
     private void BindMaterial(GpuMesh gm, int materialId)
     {
+        if (Environment.GetEnvironmentVariable("SCN_NOTEX") == "1")
+        {
+            GL.ActiveTexture(TextureUnit.Texture0);
+            GL.BindTexture(TextureTarget.Texture2D, _whiteTex);
+            GL.Uniform1(_uUseTex, 0);
+            GL.Uniform4(_uTint, 1f, 1f, 1f, 1f);
+            return;
+        }
+
         var tex = gm.MaterialTex.TryGetValue(materialId, out var t) ? t : _whiteTex;
         GL.ActiveTexture(TextureUnit.Texture0);
         GL.BindTexture(TextureTarget.Texture2D, tex);
@@ -362,5 +398,6 @@ sealed class Renderer
         public int Vbo { get; init; }
         public int Ebo { get; init; }
         public Dictionary<int, int> MaterialTex { get; } = new();
+        public bool[]? SubsetUseBaseVertex { get; set; }
     }
 }

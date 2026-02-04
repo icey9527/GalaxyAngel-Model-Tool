@@ -2,110 +2,81 @@
 
 ## SCN0（旧格式）
 
-### 0) 现状结论（重要）
+### 0) 现状结论（重要，已落地到 C#）
 
-SCN0 现在“能导出高模”，并且能把多贴图（`E_0/E_1/...`）按三角形范围切出来；整体策略仍然是“按文件内结构走”，不靠扫描目录/后缀去猜。
+SCN0 现在在 C#（Viewer/Converter）里已经可以 **按结构严格解析**，并且在 UI 里能看到 **Groups(LOD/sets)**，可切换高/低模（不同 group / 不同 container）。
 
-- 高模几何：来自 **stride=32 + tag=101/102** 的 VB/IB 块（不依赖名字判断）。
-- 材质/贴图名：优先读取文件内的 **`auto\0` 材质块**（与 SCN1 同源的概念），而不是靠“扫字符串猜贴图”。
-- 分段范围：在 `auto` 块/贴图名附近可回溯到 `start_tri/tri_count/base_vertex/vertex_count`（用来导出 OBJ 的 `usemtl` 分段）。
+当前实现的关键点（都来自 IDA 反编译/汇编行为 + 样本 hex 对齐验证，不靠扫描全文件）：
+
+- tree：按 `sub_10014AE0` 的递归结构解析（`name_cstr + 0x40 + hasChild + hasSibling`）。
+- group/entry 表：按 `sub_10014C50`（groupCount = pairCount+1）结构消费字节流，得到每个 entry 的 payload（container block）。
+- container 内 mesh blob：按 `sub_10004700` 结构解析：`decl_bitfield + vcount + VB + tag + ib_bytes + IB + subsetCount + subsetRecords`。
+- stride：严格使用 `sub_1002A207(decl_bitfield)` 的计算规则。
+- subset ranges：在 subset record 的 `+0x44` 位置（5*u32）读取 `(matId,startTri,triCount,baseV,vCnt)`。
+- 贴图名：在 subset record 的 `+0x58` 位置读取 **16 字节内联字符串**（NUL 终止；有些文件为空）。
 
 ### 1) SCN0 文件头 & 场景树
 
-- `char[8]` 常见开头：`"SCN0SCEN"`（文件 `sc06/ou06A.scn` 如此）
-- 场景树结构与 SCN1 相同；tree 从 offset `+4` 开始
+- `char[4] magic` = `"SCN0"`
+- 紧接场景树：tree 从 offset `+4` 开始
+- tree 节点结构（与 SCN1 相同的“hasChild/hasSibling”递归布局）：
+  - `name_cstr`
+  - `u8[0x40]`（blob，语义未完全解释，但按长度消费）
+  - `u32 hasChild`（==1 递归）
+  - `u32 hasSibling`（==1 递归）
 
-脚本实现：`parse_scn_tree(data, 4)`
+实现位置：`src/ScnParser.Scn1.cs` 的 `ParseTreeStrictInfo`（SCN0/SCN1 共用同一套节点解析）。
 
-### 2) SCN0 已实现的几何来源（多路尝试）
+### 2) tree 之后的顶层区段（按 loader 消费顺序）
 
-#### A) “SCN0SCEN mesh blob”（带 decl bitfield 的老布局）
+根据 `sub_100143E0`（SCN0 loader）和它调用的 `sub_10014C50/sub_10014E40`，tree 后面是按 count 串起来的区段：
 
-脚本函数：`parse_scn0_mesh_blob()`
+- `auto block table`（shape 与 SCN1 的 auto table 一致；目前主要用于 cursor 对齐）
+- 固定的若干 `u32` 配置字段（当前 viewer 不依赖其语义，仅按汇编消费以对齐 cursor）
+- `u32 pairCount` + `pairCount * (u32,u32)`
+- `u32[3]`（3 个 dword）
+- mesh table：`groupCount = pairCount + 1`
+  - 对每个 group：`u32 entryCount`
+  - 对每个 entry：`name_cstr` + `u32 flag` + `payload(size-prefixed container block)`
+- extra table（`sub_10014E40`）：`u32 count` + `count * (name_cstr + u32 flag + payload)`（目前不用于生成模型）
 
-它尝试解析：
+### 3) container block（旧 SCN0 容器头）
+
+SCN0 的 container 头是固定布局（这解释了为什么名字里会直接出现 `E/U` 这样的变体）：
+
+- `u32 size`（包含自身）
+- `u32 id/hash`
+- `char name[0x20]`：NUL 终止的固定缓冲（后面 padding=0）
+- 紧接 mesh blob（即 offset = `0x28`）
+
+> 注意：mesh table entry 的 `name_cstr` 可能在多个 container 上相同（例如都叫 `ou01`）。
+> 区分 `ou01E/ou01U` 等变体的真实名字来自 container header 的 `name[0x20]`。
+
+### 4) container 内 mesh blob（老布局，已解析）
+
+由 `sub_10004700`（vtable 方法）严格读取：
 
 - `u32 decl_bitfield`
 - `u32 vcount`
-- `VB[vcount * stride]`（stride 由 decl_bitfield 计算）
-- `u32 idx_meta0`
+- `VB[vcount * stride]`
+  - `stride = sub_1002A207(decl_bitfield)`
+- `u32 tag`：已观察到 `101` / `102`
 - `u32 ib_bytes`
-- `IB[ib_bytes]`
-- 之后可能跟一段 material/texture 段（某些样本能提供 `start_tri/tri_count/...`）
+- `IB[ib_bytes]`：`u16` 索引（三角形列表）
+- `u32 subsetCount`
+- `subsetCount * 0x68` 字节的记录：
+  - `record+0x44`：`u32 matId, startTri, triCount, baseV, vCnt`
+  - `record+0x58`：`char texName[16]`（NUL 终止；可能为空）
 
-对 `sc06/ou06A.scn` 来说，这条路目前更像“低模/某一容器”的几何（并非最高细节那块）。
+#### 已验证的 decl 布局（当前 C# 已实现）
 
-#### B) “SCN0 stride=32 + tag(101/102) 的高模块”（关键：能导出更高模）
+- `decl=0x112, stride=32`（`sc06/ou06A.scn`）：`pos(3f)@0 + nrm(3f)@12 + uv(2f)@24`
+- `decl=0x52, stride=28`（`ob101/ob101.scn`）：`pos(3f)@0 + nrm(3f)@12 + uv(u16,u16)@24`（归一化到 `[0,1]`）
 
-这块格式来自你旧脚本 `scn0.py` 的发现，但现在实现做了收敛：
+其余 `decl_bitfield` 组合仍需要继续按 vtable 的解析逻辑/渲染输入要求逐个落地（不允许“猜一个 offset 看起来对就算”）。
 
-布局：
+### 5) 仍待补齐/继续逆向的点
 
-- `u32 vcount`
-- `VB[vcount * 32]`：`pos(3f) + nrm(3f) + uv(2f)`
-- `u32 tag`：`101` 或 `102`
-- `u32 ib_bytes`
-- `IB[ib_bytes]`：`u16` 三角形索引
-
-脚本实现：
-
-- `scan_scn0_stride32_mesh_blocks(data, start=tree_end)`：只在 `tree_end` 后的有限窗口内按结构判定（不是全文件扫后缀/扫图片）
-- `decode_scn0_stride32_mesh_block()`：解码成 Mesh
-
-实测（`sc06/ou06A.scn`）：
-
-- 高模块可识别于 `0x603`：`v=11078, f=10990`
-
-### 3) SCN0 多贴图分段（已补齐到“治标更少、结果更接近”）
-
-`sc06/ou06A.scn` 的高模对应多张贴图（`ou06E_0.dds / ou06E_1.dds`），并且分段范围就存放在 `auto` 块/贴图名附近，形态类似：
-
-- `u32 start_tri`
-- `u32 tri_count`
-- `u32 base_vertex`
-- `u32 vertex_count`
-- `tex_name_cstr`（`ou06E_0.dds\0` 等）
-
-实现要点：
-
-- 贴图名来源：解析 `auto\0` 块的 `ColorMap/NormalMap/...` 字段（优先选择 `baseHint+"E"` 贴图族）。
-- subset 回溯：从 `auto` 起始位置（失败则从 `ColorMap` 字符串位置）向前 64 字节扫描 `4*u32`，选出 `tri_count` 最大的一组作为该材质的范围。
-- LOD 选择：在所有 stride32 VB/IB 块里，优先挑选能覆盖所有 subset 范围的那块（通常就是高模）。
-
-> 这一步让 SCN0 高模也能正确使用多张贴图（至少达到与文件中存储的分段范围一致）。
-
-#### C) “D3D decl520 mesh block”（某些 SCN0 文件可能包含）
-
-脚本也会对 SCN0 整文件尝试 `extract_d3d_mesh_blocks()`，以便覆盖“旧容器里嵌新布局”的情况。
-
-### 3) SCN0 贴图族（E/U）与命名
-
-SCN0 中可能同时出现多套贴图族，例如：
-
-- `ou06U_0.dds / ou06U_1.dds`
-- `ou06E_0.dds / ou06E_1.dds`
-
-当前脚本策略（不扫描目录、不枚举后缀来“猜贴图”）：
-
-- `infer_scn0_material_color_maps()`：只从 `.scn` 文件内嵌字符串里提取 `PREFIX_<idx>.<ext>`，并优先选择 `base_hint+"E"` 贴图族
-- `infer_scn0_root_name_from_texture_block()`：在贴图块附近寻找紧跟的短 root 名（如 `ou06\0`），用于输出目录/对象名（避免把 `Xou06L_c` 这种容器名当节点名）
-
-### 4) SCN0 目前“不完整”的部分（需要继续逆向落地）
-
-现在 SCN0 高模能导出，但“只有一张图”是结构信息缺失导致：
-
-- stride32 高模块本身没有 subset/material ranges
-- 文件里虽然能找到 `E_0/E_1/...`，但缺少 “每段三角形范围 -> 贴图/材质” 的表
-
-要做到 SCN1 那种“分段贴图完全正确”，需要把 SCN0 的 container/group/material 结构按逆向函数真实解析出来：
-
-- 解析 group/entry 列表：`name_cstr + u32 + (mesh_record or mesh_blob)`（而不是靠扫描 offset）
-- 解析材质/资源映射表：把 `E_*` / 其它 maps 与具体 mesh/subset 绑定起来
-
-对应逆向函数（你提供的新版链路，作为下一步对齐目标）：
-
-- `sub_100143E0`：SCN0 顶层 loader（新版）
-- `sub_10014C50`：看起来在建立/填充一张“名字 -> 资源(Handle)”列表，并且更新某些标志位
-- `sub_10014E40`：另一张类似的资源表/列表
-
-> 备注：SCN0 的“治本”目标，是把这些 count/record 的结构在 Python 中复刻到位，从而得到真正的 subset ranges/材质绑定，而不是仅仅找到一块能画出来的 VB/IB。
+- 完整覆盖更多 `decl_bitfield` → vertex layout（目前只实现了已验证的两种）。
+- subset record 中贴图名为空时，如何从其它表（auto table / extra table / 资源表）恢复材质名/贴图绑定。
+- `auto block table` 的语义字段（目前只按结构跳过用于对齐；如果后续需要与 SCN1 一样完整材质集，可继续落地）。

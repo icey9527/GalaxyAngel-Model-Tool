@@ -268,6 +268,8 @@ sealed class ViewerForm : Form
 
     private readonly List<ScnModel> _currentModels = new();
     private ScnParser.Scn1Index? _currentScn1Index;
+    private ScnParser.Scn0Index? _currentScn0Index;
+    private string _currentMagic = "";
     private void OnPickFile()
     {
         if (_renderer == null) return;
@@ -287,15 +289,14 @@ sealed class ViewerForm : Form
             if (magic == "SCN1")
             {
                 var idx = ScnParser.ParseScn1Index(data);
-                return (idx.Models, folder: Path.GetDirectoryName(path) ?? ".", file: Path.GetFileName(path), magic, idx);
+                return (idx.Models, folder: Path.GetDirectoryName(path) ?? ".", file: Path.GetFileName(path), magic, idx1: idx, idx0: (ScnParser.Scn0Index?)null);
             }
             if (magic == "SCN0")
             {
-                var mesh = ScnParser.ParseScn0High(path, data);
-                var models = mesh != null ? new List<ScnModel> { new ScnModel(Path.GetFileNameWithoutExtension(path), mesh) } : new List<ScnModel>();
-                return (models, folder: Path.GetDirectoryName(path) ?? ".", file: Path.GetFileName(path), magic, idx: (ScnParser.Scn1Index?)null);
+                var idx0 = ScnParser.ParseScn0Index(path, data);
+                return (idx0.Models, folder: Path.GetDirectoryName(path) ?? ".", file: Path.GetFileName(path), magic, idx1: (ScnParser.Scn1Index?)null, idx0);
             }
-            return (new List<ScnModel>(), folder: Path.GetDirectoryName(path) ?? ".", file: Path.GetFileName(path), magic, idx: (ScnParser.Scn1Index?)null);
+            return (new List<ScnModel>(), folder: Path.GetDirectoryName(path) ?? ".", file: Path.GetFileName(path), magic, idx1: (ScnParser.Scn1Index?)null, idx0: (ScnParser.Scn0Index?)null);
         }, token).ContinueWith(t =>
         {
             if (t.IsCanceled || token.IsCancellationRequested) return;
@@ -305,7 +306,7 @@ sealed class ViewerForm : Form
                 BeginInvoke(() => MessageBox.Show(this, msg, AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Error));
                 return;
             }
-            var (models, folder, file, magic, idx) = t.Result;
+            var (models, folder, file, magic, idx1, idx0) = t.Result;
             if (models.Count == 0)
             {
                 BeginInvoke(() => MessageBox.Show(this, "Failed to parse this SCN file.", AppTitle,
@@ -319,10 +320,12 @@ sealed class ViewerForm : Form
                 {
                     _currentModels.Clear();
                     _currentModels.AddRange(models);
-                    _currentScn1Index = idx;
-                    var defaultVisible = ChooseDefaultVisibleModels(idx, _currentModels);
+                    _currentScn1Index = idx1;
+                    _currentScn0Index = idx0;
+                    _currentMagic = magic;
+                    var defaultVisible = ChooseDefaultVisibleModels(idx1, idx0, _currentModels);
                     _renderer?.LoadScene(_currentModels, folder, defaultVisible);
-                    BuildTree(idx, defaultVisible);
+                    BuildTree(idx1, idx0, defaultVisible);
                     UpdateTitle(file, magic, defaultVisible);
 
                     BuildMeshesList();
@@ -363,7 +366,7 @@ sealed class ViewerForm : Form
             // Selection is informational; visibility is controlled by checkboxes.
             if (node?.Tag is not ScnTreeSelection) return;
             var visible = GetVisibleModelsFromTree();
-            UpdateTitle(file, _currentScn1Index != null ? "SCN1" : "SCN0", visible);
+            UpdateTitle(file, _currentMagic, visible);
         }
         catch (Exception ex)
         {
@@ -395,8 +398,7 @@ sealed class ViewerForm : Form
         var fi = _list.SelectedIndex;
         if (fi < 0 || fi >= _scnFiles.Count) return;
         var file = Path.GetFileName(_scnFiles[fi]);
-        var magic = _currentScn1Index != null ? "SCN1" : "SCN0";
-        UpdateTitle(file, magic, visible);
+        UpdateTitle(file, _currentMagic, visible);
     }
 
     private static void SetChildrenChecked(TreeNode node, bool isChecked)
@@ -437,16 +439,17 @@ sealed class ViewerForm : Form
         Text = $"{AppTitle} - {file} ({magic})  (v={v}, f={f})";
     }
 
-    private static IReadOnlyCollection<int> ChooseDefaultVisibleModels(ScnParser.Scn1Index? idx, List<ScnModel> models)
+    private static IReadOnlyCollection<int> ChooseDefaultVisibleModels(ScnParser.Scn1Index? idx1, ScnParser.Scn0Index? idx0, List<ScnModel> models)
     {
         if (models.Count == 0) return Array.Empty<int>();
-        if (idx == null || idx.Groups.Count == 0)
+        var groups = idx1?.Groups ?? idx0?.Groups ?? new List<ScnGroupEntry>();
+        if (groups.Count == 0)
             return Enumerable.Range(0, models.Count).ToArray();
 
         // Prefer the group with the largest total face count.
         var bestGroup = -1;
         var bestFaces = -1;
-        foreach (var g in idx.Groups.GroupBy(g => g.GroupIndex))
+        foreach (var g in groups.GroupBy(g => g.GroupIndex))
         {
             var containers = g.Select(x => x.ContainerIndex).Distinct().ToHashSet();
             var faces = 0;
@@ -460,16 +463,16 @@ sealed class ViewerForm : Form
 
         if (bestGroup < 0) return Enumerable.Range(0, models.Count).ToArray();
 
-        var bestContainers = idx.Groups.Where(x => x.GroupIndex == bestGroup).Select(x => x.ContainerIndex).Distinct().ToHashSet();
+        var bestContainers = groups.Where(x => x.GroupIndex == bestGroup).Select(x => x.ContainerIndex).Distinct().ToHashSet();
         return models.Select((m, i) => (m, i)).Where(t => bestContainers.Contains(t.m.ContainerIndex)).Select(t => t.i).ToArray();
     }
 
-    private void BuildTree(ScnParser.Scn1Index? idx, IReadOnlyCollection<int> defaultVisible)
+    private void BuildTree(ScnParser.Scn1Index? idx1, ScnParser.Scn0Index? idx0, IReadOnlyCollection<int> defaultVisible)
     {
         _tree.BeginUpdate();
         _buildingTree = true;
         _tree.Nodes.Clear();
-        if (idx == null)
+        if (idx1 == null && idx0 == null)
         {
             _buildingTree = false;
             _tree.EndUpdate();
@@ -478,19 +481,23 @@ sealed class ViewerForm : Form
 
         // Pre-index the scene tree by name for easy cross-reference.
         var sceneNameIndex = new Dictionary<string, List<ScnTreeNodeInfo>>(StringComparer.OrdinalIgnoreCase);
-        if (idx.Tree != null)
-            IndexSceneNames(idx.Tree, sceneNameIndex);
+        var tree = idx1?.Tree ?? idx0?.Tree;
+        if (tree != null)
+            IndexSceneNames(tree, sceneNameIndex);
+
+        var containersInfo = idx1?.Containers ?? idx0!.Containers;
+        var groupsInfo = idx1?.Groups ?? idx0!.Groups;
 
         // Groups (LOD/sets) -> containers/entries -> meshes
         var groupsRoot = new TreeNode("Groups (LOD/sets)");
-        foreach (var g in idx.Groups.GroupBy(x => x.GroupIndex).OrderBy(g => g.Key))
+        foreach (var g in groupsInfo.GroupBy(x => x.GroupIndex).OrderBy(g => g.Key))
         {
             var names = g.Select(x => x.Name).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().Take(3).ToList();
             var suffix = names.Count > 0 ? $" ({string.Join(", ", names)})" : "";
             var gNode = new TreeNode($"Group {g.Key}{suffix}") { Checked = false };
             foreach (var e in g.OrderBy(x => x.ContainerIndex))
             {
-                var cname = idx.Containers.FirstOrDefault(c => c.Index == e.ContainerIndex)?.Name ?? $"container{e.ContainerIndex}";
+                var cname = containersInfo.FirstOrDefault(c => c.Index == e.ContainerIndex)?.Name ?? $"container{e.ContainerIndex}";
                 var cn = new TreeNode($"{cname}  [{e.Name}]") { Checked = false };
 
                 // Cross-reference: show matching Scene Tree nodes (same name string) if present.
@@ -507,10 +514,10 @@ sealed class ViewerForm : Form
         }
         _tree.Nodes.Add(groupsRoot);
 
-        if (idx.MeshTable != null)
+        if (idx1?.MeshTable != null)
         {
-            var mtRoot = new TreeNode($"Mesh Table (@0x{idx.MeshTable.StartOffset:X})");
-            foreach (var g in idx.MeshTable.Groups.OrderBy(g => g.GroupIndex))
+            var mtRoot = new TreeNode($"Mesh Table (@0x{idx1.MeshTable.StartOffset:X})");
+            foreach (var g in idx1.MeshTable.Groups.OrderBy(g => g.GroupIndex))
             {
                 var gNode = new TreeNode($"Group {g.GroupIndex} ({g.Entries.Count})");
                 foreach (var e in g.Entries)
@@ -528,9 +535,21 @@ sealed class ViewerForm : Form
             }
             _tree.Nodes.Add(mtRoot);
         }
+        else if (idx0 != null)
+        {
+            var mtRoot = new TreeNode("Mesh Table");
+            foreach (var g in idx0.MeshTable.OrderBy(g => g.GroupIndex))
+            {
+                var gNode = new TreeNode($"Group {g.GroupIndex} ({g.Entries.Count})");
+                foreach (var e in g.Entries)
+                    gNode.Nodes.Add(new TreeNode($"{e.Name}  (flag={e.Flag}, bytes={e.Payload.Length})"));
+                mtRoot.Nodes.Add(gNode);
+            }
+            _tree.Nodes.Add(mtRoot);
+        }
         else
         {
-            var scan = idx.MeshTableScan;
+            var scan = idx1?.MeshTableScan;
             if (scan != null)
             {
                 _tree.Nodes.Add(new TreeNode(
@@ -540,8 +559,8 @@ sealed class ViewerForm : Form
 
         // Raw scene tree (names only, for inspection)
         var sceneRoot = new TreeNode("Scene Tree (nodes)");
-        if (idx.Tree != null)
-            sceneRoot.Nodes.Add(BuildSceneNode(idx.Tree));
+        if (tree != null)
+            sceneRoot.Nodes.Add(BuildSceneNode(tree));
         _tree.Nodes.Add(sceneRoot);
 
         UpdateParentChecks(_tree.Nodes);

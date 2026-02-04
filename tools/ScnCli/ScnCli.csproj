@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows7.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+    <RunAnalyzersDuringBuild>false</RunAnalyzersDuringBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\GalaxyAngel Model Tool.csproj" />
+  </ItemGroup>
+</Project>
