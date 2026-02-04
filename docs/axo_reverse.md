@@ -98,7 +98,7 @@ So if the game references `enm01` the tool loads `enm01.agi.png`.
 
 - Renderer flips V in shader (`v = 1 - v`) because textures are loaded top-to-bottom.
 - AXO VIF UVs are additionally pre-flipped during decode so the on-screen result is correct.
-- OBJ export flips V (`vt u (1-v)`) so external DCC tools match the in-app render.
+- AXO OBJ export flips V back so external viewers match the in-app render.
 - Texture alpha is preserved by default. Set `SCN_TEX_FORCE_OPAQUE=1` to force alpha to 255 (discard transparency).
 
 ## Debug helpers (no UI changes)
