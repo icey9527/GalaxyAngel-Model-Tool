@@ -39,7 +39,7 @@ Notes:
 ## Not supported
 
 - GA1 Microsoft official `X` model format
-- GA1 PS2 `sc0` model format
+- GA1 PS2 `sc0、ao3` model format
 
 ## Build (single EXE)
 
